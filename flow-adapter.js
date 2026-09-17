@@ -597,32 +597,47 @@
     return !!(findPromptBox() && !findSubmitButton());
   }
 
-  // Convert blob URL or DOM image to data URL inside page context
+  // Convert blob URL or DOM image to clean PNG data URL inside page context (prevents .jfif / WebP)
   async function blobToDataUrl(url) {
     if (!url) throw new Error("No URL provided");
-    if (url.startsWith("data:")) return url;
 
-    // Method A: Fetch as Blob
+    // Method 1: If an existing DOM <img> already has this source and is loaded, draw to canvas
+    const imgEl = [...document.querySelectorAll("img")].find((i) => (i.src === url || i.currentSrc === url));
+    if (imgEl && (imgEl.naturalWidth > 0 || imgEl.width > 0)) {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = imgEl.naturalWidth || imgEl.width || 512;
+        canvas.height = imgEl.naturalHeight || imgEl.height || 512;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(imgEl, 0, 0);
+        return canvas.toDataURL("image/png");
+      } catch (e) {
+        console.debug("[Flow Adapter] Canvas draw from imgEl failed, trying blob fetch:", e);
+      }
+    }
+
+    // Method 2: Fetch blob in page context, decode with createImageBitmap, and draw onto canvas
     try {
       const resp = await fetch(url);
       const blob = await resp.blob();
-      const reader = new FileReader();
-      const dataUrl = await new Promise((resolve, reject) => {
-        reader.onloadend = () => resolve(reader.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-      });
-      return dataUrl;
-    } catch (fetchErr) {
-      // Method B: Draw from existing DOM <img> onto canvas
-      const imgEl = [...document.querySelectorAll("img")].find((i) => i.src === url || i.currentSrc === url);
-      if (!imgEl) throw fetchErr;
+      const bmp = await createImageBitmap(blob);
       const canvas = document.createElement("canvas");
-      canvas.width = imgEl.naturalWidth || imgEl.width || 512;
-      canvas.height = imgEl.naturalHeight || imgEl.height || 512;
+      canvas.width = bmp.width;
+      canvas.height = bmp.height;
       const ctx = canvas.getContext("2d");
-      ctx.drawImage(imgEl, 0, 0);
+      ctx.drawImage(bmp, 0, 0);
       return canvas.toDataURL("image/png");
+    } catch (fetchErr) {
+      // Method 3: Fallback from existing DOM img
+      if (imgEl) {
+        const canvas = document.createElement("canvas");
+        canvas.width = imgEl.naturalWidth || imgEl.width || 512;
+        canvas.height = imgEl.naturalHeight || imgEl.height || 512;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(imgEl, 0, 0);
+        return canvas.toDataURL("image/png");
+      }
+      throw fetchErr;
     }
   }
 
@@ -786,32 +801,24 @@
           case "fetchBlobAsDataUrl": {
             try {
               const url = msg.url;
-              // If it is already a data URL, return directly
-              if (url.startsWith("data:")) return sendResponse({ ok: true, dataUrl: url });
+              // If it is already a PNG data URL, return directly
+              if (url.startsWith("data:image/png")) return sendResponse({ ok: true, dataUrl: url });
 
-              // Method A: Fetch as Blob
-              try {
-                const resp = await fetch(url);
-                const blob = await resp.blob();
-                const reader = new FileReader();
-                const dataUrl = await new Promise((resolve, reject) => {
-                  reader.onloadend = () => resolve(reader.result);
-                  reader.onerror = reject;
-                  reader.readAsDataURL(blob);
-                });
-                return sendResponse({ ok: true, dataUrl });
-              } catch (fetchErr) {
-                // Method B: Draw from existing DOM <img> onto canvas
-                const imgEl = [...document.querySelectorAll("img")].find((i) => i.src === url || i.currentSrc === url);
-                if (!imgEl) throw fetchErr;
-                const canvas = document.createElement("canvas");
-                canvas.width = imgEl.naturalWidth || imgEl.width || 512;
-                canvas.height = imgEl.naturalHeight || imgEl.height || 512;
-                const ctx = canvas.getContext("2d");
-                ctx.drawImage(imgEl, 0, 0);
-                return sendResponse({ ok: true, dataUrl: canvas.toDataURL("image/png") });
-              }
+              const dataUrl = await blobToDataUrl(url);
+              return sendResponse({ ok: true, dataUrl });
             } catch (err) {
+              // Fallback: draw from existing DOM <img> onto canvas
+              try {
+                const imgEl = [...document.querySelectorAll("img")].find((i) => i.src === msg.url || i.currentSrc === msg.url);
+                if (imgEl) {
+                  const canvas = document.createElement("canvas");
+                  canvas.width = imgEl.naturalWidth || imgEl.width || 512;
+                  canvas.height = imgEl.naturalHeight || imgEl.height || 512;
+                  const ctx = canvas.getContext("2d");
+                  ctx.drawImage(imgEl, 0, 0);
+                  return sendResponse({ ok: true, dataUrl: canvas.toDataURL("image/png") });
+                }
+              } catch (_) {}
               return sendResponse({ ok: false, error: err.message });
             }
           }
@@ -827,7 +834,7 @@
               c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
               const ctx = c.getContext("2d"); ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
               ctx.drawImage(bmp, 0, 0, c.width, c.height);
-              return sendResponse({ ok: true, dataUrl: c.toDataURL("image/jpeg", 0.92), w: c.width, h: c.height });
+              return sendResponse({ ok: true, dataUrl: c.toDataURL("image/png"), w: c.width, h: c.height });
             } catch (e) { return sendResponse({ ok: false, error: String(e && e.message || e) }); }
           }
           case "download": {

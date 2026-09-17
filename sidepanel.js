@@ -9,6 +9,9 @@ function logLine(text, cls = "") {
   d.textContent = text;
   $("log").prepend(d);
 }
+function logStatus(text) {
+  logLine(text, "warn");
+}
 
 function parseShots(spec) {
   const s = (spec || "").trim();
@@ -145,18 +148,21 @@ function cfgFromUI() {
     upscale: $("upscale").checked,
     waitMode: $("waitMode").value,
     autoDownload: $("autoDownload").checked,
+    subfolder: $("inputSubfolder") ? $("inputSubfolder").value.trim() : "",
     delaySec: parseInt($("delaySec").value, 10) || 45,
     gapSec: $("waitMode").value === "fast" ? 1 : Math.min(8, Math.max(2, Math.round((parseInt($("delaySec").value, 10) || 45) / 12))),
   };
 }
 
 const btnNext = $("btnNext") || $("next");
+const btnStop = $("btnStop") || $("stop");
+const btnStart = $("start");
 let CURRENT_JOB = null;
 
 function setRunning(on, manual = false) {
-  $("start").disabled = on;
+  btnStart.disabled = on;
   $("pause").disabled = !on;
-  $("stop").disabled = !on;
+  if (btnStop) btnStop.disabled = !on;
   if (btnNext) btnNext.disabled = !on; // Enabled whenever running or paused!
   document.querySelectorAll("select,input").forEach((e) => (e.disabled = on));
 }
@@ -198,10 +204,10 @@ function syncSource() {
   refreshCount();
 }
 $("source").addEventListener("change", syncSource);
-["collection", "shots", "pasteText", "prefix"].forEach((id) => $(id).addEventListener("input", refreshCount));
+["collection", "shots", "pasteText", "prefix", "inputSubfolder"].forEach((id) => $(id) && $(id).addEventListener("input", refreshCount));
 
 // --- persist settings + prompt text across opens -------------------------
-const PERSIST = ["source", "pasteText", "prefix", "collection", "shots", "waitMode", "delaySec"];
+const PERSIST = ["source", "pasteText", "prefix", "collection", "shots", "waitMode", "delaySec", "inputSubfolder"];
 const PERSIST_CHK = ["autoDownload", "upscale"];
 function saveState() {
   const s = {};
@@ -249,11 +255,21 @@ if (btnNext) {
   });
 }
 
-$("stop").addEventListener("click", async () => {
-  await chrome.runtime.sendMessage({ type: "stop" });
-  setRunning(false);
-  logLine("Stopped.", "warn");
-});
+if (btnStop) {
+  btnStop.addEventListener("click", () => {
+    chrome.runtime.sendMessage({ cmd: "stopBatch", type: "stopBatch" });
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    if (btnNext) {
+      btnNext.disabled = true;
+      btnNext.style.border = "";
+      btnNext.style.boxShadow = "";
+    }
+    setRunning(false);
+    $("now").textContent = "⏹ Stopped";
+    logStatus("⏹ Stopped by user.");
+  });
+}
 
 $("btnDownloadLatest").addEventListener("click", async () => {
   logLine("Requesting latest generated image...", "ok");
