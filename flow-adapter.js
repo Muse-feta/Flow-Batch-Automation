@@ -586,59 +586,67 @@
   // control — so treat that (plus %-badges / spinners) as busy.
   function isGenerating() {
     if (genCount() > 0) return true;
-    if (document.querySelector('[role="progressbar"], [aria-busy="true"]')) return true;
+    if (document.querySelector('[role="progressbar"], [aria-busy="true"], .progress-bar, [data-is-generating="true"]')) return true;
     // a Stop control anywhere in the lower composer means the agent is working
     const stop = [...document.querySelectorAll('button, [role="button"]')].some((b) => {
-      if (!visible(b) || b.getBoundingClientRect().top < 300) return false;
+      if (!visible(b) || b.getBoundingClientRect().top < 250) return false;
       return isStopButton(b);
     });
     if (stop) return true;
-    // fallback: the composer is present but its send arrow is gone => still busy
-    return !!(findPromptBox() && !findSubmitButton());
+
+    // Check for thinking / generating text chips in Flow
+    const busyChip = [...document.querySelectorAll("span, div, p, [role='status']")].some((el) => {
+      if (!visible(el)) return false;
+      const t = (el.textContent || "").trim();
+      return /^(generating|thinking|creating|rendering|running)\b/i.test(t) && el.getBoundingClientRect().top > 200;
+    });
+    if (busyChip) return true;
+
+    return false;
   }
 
   // Convert blob URL or DOM image to clean PNG data URL inside page context (prevents .jfif / WebP)
   async function blobToDataUrl(url) {
     if (!url) throw new Error("No URL provided");
 
-    // Method 1: If an existing DOM <img> already has this source and is loaded, draw to canvas
-    const imgEl = [...document.querySelectorAll("img")].find((i) => (i.src === url || i.currentSrc === url));
-    if (imgEl && (imgEl.naturalWidth > 0 || imgEl.width > 0)) {
-      try {
-        const canvas = document.createElement("canvas");
-        canvas.width = imgEl.naturalWidth || imgEl.width || 512;
-        canvas.height = imgEl.naturalHeight || imgEl.height || 512;
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(imgEl, 0, 0);
-        return canvas.toDataURL("image/png");
-      } catch (e) {
-        console.debug("[Flow Adapter] Canvas draw from imgEl failed, trying blob fetch:", e);
-      }
-    }
-
-    // Method 2: Fetch blob in page context, decode with createImageBitmap, and draw onto canvas
+    // Method 1: Fetch raw blob directly and convert with FileReader (avoids canvas black frame)
     try {
       const resp = await fetch(url);
       const blob = await resp.blob();
-      const bmp = await createImageBitmap(blob);
-      const canvas = document.createElement("canvas");
-      canvas.width = bmp.width;
-      canvas.height = bmp.height;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(bmp, 0, 0);
-      return canvas.toDataURL("image/png");
-    } catch (fetchErr) {
-      // Method 3: Fallback from existing DOM img
-      if (imgEl) {
-        const canvas = document.createElement("canvas");
-        canvas.width = imgEl.naturalWidth || imgEl.width || 512;
-        canvas.height = imgEl.naturalHeight || imgEl.height || 512;
-        const ctx = canvas.getContext("2d");
-        ctx.drawImage(imgEl, 0, 0);
-        return canvas.toDataURL("image/png");
+      if (blob && blob.size > 100) {
+        const reader = new FileReader();
+        return await new Promise((resolve, reject) => {
+          reader.onloadend = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
       }
-      throw fetchErr;
+    } catch (fetchErr) {
+      console.debug("[Flow Adapter] Direct blob fetch failed, falling back to canvas:", fetchErr);
     }
+
+    // Method 2: If an existing DOM <img> already has this source and is loaded, draw to canvas
+    const imgEl = [...document.querySelectorAll("img")].find((i) => (i.src === url || i.currentSrc === url));
+    if (imgEl) {
+      try {
+        if (typeof imgEl.decode === "function") {
+          await imgEl.decode().catch(() => {});
+        }
+        const w = imgEl.naturalWidth || imgEl.width || 512;
+        const h = imgEl.naturalHeight || imgEl.height || 512;
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(imgEl, 0, 0, w, h);
+        return canvas.toDataURL("image/png");
+      } catch (e) {
+        console.debug("[Flow Adapter] Canvas draw from imgEl failed:", e);
+      }
+    }
+    throw new Error("Failed to convert image to Data URL");
   }
 
   // ---- download (Phase 2 fallback) -----------------------------------------
@@ -798,6 +806,93 @@
           case "mediaItems":
             // generated stills as {src, name}, newest-first (name = Flow's caption)
             return sendResponse({ ok: true, images: genImgItems(), videos: genVideos() });
+          case "getLatestGeneratedDataUrl": {
+            (async () => {
+              try {
+                // 1. Locate all valid generated images in Flow
+                const imgs = [...document.querySelectorAll("img")].filter((img) => {
+                  const w = img.naturalWidth || img.clientWidth || 0;
+                  const h = img.naturalHeight || img.clientHeight || 0;
+                  const src = img.currentSrc || img.src || "";
+                  if (w < 150 || h < 150) return false;
+                  if (/\/a[/-]/.test(src) || src.includes("googleusercontent.com/a/")) return false;
+                  return Boolean(src);
+                });
+
+                if (!imgs.length) {
+                  // Fallback: check canvas elements
+                  const canvases = [...document.querySelectorAll("canvas")].filter((c) => {
+                    const w = c.width || c.clientWidth || 0;
+                    const h = c.height || c.clientHeight || 0;
+                    return w >= 150 && h >= 150 && visible(c);
+                  });
+                  if (canvases.length) {
+                    try {
+                      const c = canvases[0];
+                      const dataUrl = c.toDataURL("image/png");
+                      if (dataUrl && dataUrl.length > 200) {
+                        return sendResponse({ ok: true, dataUrl, width: c.width, height: c.height, src: "canvas" });
+                      }
+                    } catch (_) {}
+                  }
+                  return sendResponse({ ok: false, error: "No generated image found on page" });
+                }
+
+                const targetImg = imgs[0]; // newest generation is topmost
+                const imgSrc = targetImg.currentSrc || targetImg.src;
+
+                // Method 1: Fetch raw image blob directly in page context (Preserves exact bytes, avoids black canvas)
+                try {
+                  const resp = await fetch(imgSrc);
+                  const blob = await resp.blob();
+                  if (blob && blob.size > 1000) {
+                    const reader = new FileReader();
+                    const dataUrl = await new Promise((resolve, reject) => {
+                      reader.onloadend = () => resolve(reader.result);
+                      reader.onerror = reject;
+                      reader.readAsDataURL(blob);
+                    });
+                    return sendResponse({
+                      ok: true,
+                      dataUrl,
+                      width: targetImg.naturalWidth || targetImg.clientWidth || 1024,
+                      height: targetImg.naturalHeight || targetImg.clientHeight || 576,
+                      src: imgSrc,
+                    });
+                  }
+                } catch (fetchErr) {
+                  console.warn("[Flow Automation] Direct fetch failed, trying decoded canvas fallback:", fetchErr);
+                }
+
+                // Method 2: Safe Canvas Fallback (MUST await decode() to prevent black frame)
+                try {
+                  if (typeof targetImg.decode === "function") {
+                    await targetImg.decode();
+                  }
+                } catch (e) {
+                  // Continue if decode isn't supported or already decoded
+                }
+
+                const w = targetImg.naturalWidth || targetImg.width || 1024;
+                const h = targetImg.naturalHeight || targetImg.height || 576;
+                const canvas = document.createElement("canvas");
+                canvas.width = w;
+                canvas.height = h;
+                const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+                // Draw onto white background to ensure transparency doesn't render black
+                ctx.fillStyle = "#FFFFFF";
+                ctx.fillRect(0, 0, w, h);
+                ctx.drawImage(targetImg, 0, 0, w, h);
+
+                const dataUrl = canvas.toDataURL("image/png");
+                return sendResponse({ ok: true, dataUrl, width: w, height: h, src: imgSrc });
+              } catch (err) {
+                return sendResponse({ ok: false, error: err.message });
+              }
+            })();
+            return true; // Keep message channel open for async response
+          }
           case "fetchBlobAsDataUrl": {
             try {
               const url = msg.url;

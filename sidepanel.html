@@ -4,110 +4,172 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="sidepanel.css" />
-  <title>Flow Batch Automation</title>
+  <title>Flow Batch Automator</title>
 </head>
 <body>
-  <header>
-    <h1>Flow Batch Automation</h1>
-    <div id="loaded" class="muted">loading…</div>
+  <!-- Header with Brand & Mode Switch Tabs (Rounded Pills) -->
+  <header class="app-header">
+    <div class="brand-group">
+      <span class="brand-badge">⚡ FLOW</span>
+      <h1 class="brand-title">Flow Automator</h1>
+    </div>
+
+    <!-- Mode switch tabs: [Images] | [Videos] -->
+    <div class="mode-tabs">
+      <button type="button" class="tab-pill active" id="tabModeImages" data-mode="image">Images</button>
+      <button type="button" class="tab-pill" id="tabModeVideos" data-mode="video">Videos</button>
+    </div>
   </header>
 
-  <section class="card">
-    <div class="row">
-      <label>Source</label>
-      <select id="source">
+  <!-- Global Action Controls (Sticky/Top) -->
+  <section class="global-controls">
+    <button id="start" class="btn-ctrl btn-start">▶ Start</button>
+    <button id="pause" class="btn-ctrl btn-secondary" disabled>⏸ Pause</button>
+    <button id="btnNext" class="btn-ctrl btn-secondary" disabled>Next ⏭</button>
+    <button id="btnStop" class="btn-ctrl btn-danger" disabled>⏹ Stop</button>
+  </section>
+
+  <!-- Destination Folder Picker (Native File System Access API) -->
+  <div class="folder-select-group" style="margin-bottom: 14px;">
+    <label style="display:block; font-size:12px; color:#9ca3af; margin-bottom:6px; font-weight:600;">
+      Destination Folder <span style="color:#ef4444;">*</span>:
+    </label>
+    <div style="display: flex; gap: 8px; align-items: center;">
+      <button id="btnBrowseFolder" type="button" style="padding: 8px 14px; background: #27272a; color: #fff; border: 1px solid #3f3f46; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px; white-space: nowrap;">
+        📁 Browse Folder
+      </button>
+      <div id="selectedFolderBadge" style="flex: 1; padding: 7px 10px; background: #18181b; border: 1px dashed #3f3f46; border-radius: 6px; font-size: 12px; color: #71717a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer;" title="Click to browse folder">
+        No folder selected
+      </div>
+    </div>
+  </div>
+
+  <!-- Prompts Input Section -->
+  <section class="card input-card">
+    <div class="card-row space-between">
+      <label class="label-header">Prompts Source</label>
+      <select id="source" class="select-source">
         <option value="paste" selected>Paste my own prompts</option>
-        <option value="bundled">Bundled 290 (collections)</option>
+        <option value="bundled">Bundled collections</option>
       </select>
     </div>
 
     <div id="pasteBlock">
-      <label>Prompts — one per line (blank line = separator for multi-line prompts)</label>
-      <textarea id="pasteText" rows="8" placeholder="Paste one prompt per line, e.g.
-A photorealistic 3 inch boxed cushion in emerald velvet on a window seat...
-A macro close-up of the velvet pile, soft raking light...
-
-(Or separate multi-line prompts with a blank line.)"></textarea>
-      <div class="row">
-        <label>Name prefix</label>
-        <input id="prefix" type="text" placeholder="optional, e.g. velvet  → used in progress + filenames" />
+      <textarea id="pasteText" rows="6" placeholder="Paste one prompt per line (or markdown blocks):
+#0-00 A photorealistic wide shot of emerald velvet on a window seat...
+#0-04 A macro close-up of the velvet pile, soft raking light...
+#2-06 Cinematic wide establishing shot of the conservatory..."></textarea>
+      
+      <div class="paste-controls">
+        <button id="btnLoadPrompts" type="button" class="btn-load-prompts">⚡ Load Prompts</button>
+        <div class="prefix-input-wrap">
+          <input id="prefix" type="text" placeholder="Optional tag prefix" />
+        </div>
       </div>
     </div>
 
     <div id="bundledBlock" style="display:none">
-      <div class="row">
-        <label>Collections</label>
-        <select id="collection"><option value="*">All (29)</option></select>
+      <div class="card-row">
+        <label>Collection</label>
+        <select id="collection"><option value="*">All Collections</option></select>
       </div>
-      <div class="row">
+      <div class="card-row">
         <label>Shots</label>
-        <input id="shots" type="text" placeholder="e.g. 1,2,5 or 1-3 (blank = all 10)" />
+        <input id="shots" type="text" placeholder="e.g. 1,2,5 or 1-3 (blank = all)" />
       </div>
     </div>
   </section>
 
-  <section class="card">
-    <div class="note">
-      ⚙️ <b>Set Mode, Aspect, Outputs &amp; Model in Flow itself</b> before you start —
-      click the model chip (e.g. “🍌 Nano&nbsp;Banana&nbsp;2 · 1x”) in Flow’s prompt bar
-      and pick Image/Video, aspect, outputs and model there. The extension uses
-      whatever Flow is set to and saves however many images Flow produces.
+  <!-- Queue Progress Overview -->
+  <section class="queue-overview">
+    <div class="overview-header">
+      <span class="overview-title">Queue Status: <strong id="queueCount">0</strong> prompts</span>
+      <span id="now" class="now-badge">Idle</span>
     </div>
-    <div class="grid2">
-      <div><label>Wait mode</label>
-        <select id="waitMode">
-          <option value="fast" selected>Fast (waits per image)</option>
-          <option value="auto">Auto (wait + download each)</option>
-          <option value="fixed">Fixed delay</option>
-          <option value="manual">Manual (I click Next)</option>
-        </select>
-      </div>
-      <div><label>Fixed delay (s)</label>
-        <input id="delaySec" type="number" value="45" min="2" title="Used only in Fixed delay mode" />
-      </div>
-    </div>
-    <div class="row" style="margin-top:4px">
-      <label style="width:auto"><input id="autoDownload" type="checkbox" checked style="width:auto;margin-right:6px" />Auto-download → Downloads/Flow-Automation/&lt;timestamp&gt;/&lt;folder&gt;/</label>
-    </div>
-    <div class="row" id="upscaleWrap">
-      <label style="width:auto"><input id="upscale" type="checkbox" style="width:auto;margin-right:6px" />Upscale images to 2048px (interpolated — bigger file, not extra detail)</label>
-    </div>
-  </section>
-
-  <div style="margin-bottom: 10px;">
-    <label style="font-size: 12px; color: #9ca3af; display: block; margin-bottom: 4px;">Download Subfolder:</label>
-    <input id="inputSubfolder" type="text" placeholder="e.g. HistoryProject/Episode1" style="width: 100%; padding: 6px 8px; border-radius: 4px; background: #1f2937; color: #fff; border: 1px solid #374151; box-sizing: border-box;" />
-  </div>
-
-  <section class="actions">
-    <button id="start" class="primary">Start</button>
-    <button id="pause" disabled>Pause</button>
-    <button id="btnNext" disabled>Next ▶</button>
-    <button id="btnStop" disabled>Stop</button>
-  </section>
-
-  <div class="manual-actions" style="margin-top: 12px; display: flex; gap: 8px;">
-    <button id="btnDownloadLatest" type="button" style="flex: 1; padding: 8px; font-weight: bold; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer;">
-      ⬇ Download Latest Generated
-    </button>
-    <button id="btnDownloadAll" type="button" style="flex: 1; padding: 8px; background: #374151; color: #fff; border: none; border-radius: 4px; cursor: pointer;">
-      ⬇ Download All Visible
-    </button>
-  </div>
-
-  <section class="card">
-    <div class="row"><strong>Queue:</strong> <span id="queueCount">0</span> prompts</div>
     <progress id="bar" value="0" max="1"></progress>
-    <div id="now" class="muted">idle</div>
   </section>
 
-  <section class="card log">
-    <div id="log"></div>
+  <!-- Card-Based Prompt Queue List -->
+  <section class="queue-list-section">
+    <div class="queue-list-header">
+      <span class="section-heading">Prompt Queue</span>
+      <span id="queueProgressBadge" class="badge-count">0 / 0</span>
+    </div>
+    <div id="promptQueueList" class="prompt-queue-list">
+      <div class="empty-queue-msg">No prompts loaded. Paste your prompts above and click "Load Prompts".</div>
+    </div>
   </section>
 
-  <footer class="muted">
-    Open a Flow <b>project</b>tab first. Selectors live in <code>flow-adapter.js</code>.
+  <!-- Collapsible Settings & Manual Download Actions -->
+  <details class="collapsible-card">
+    <summary class="collapsible-summary">⚙️ Settings &amp; Manual Downloads</summary>
+    <div class="collapsible-content">
+      <div class="manual-actions" style="margin-bottom: 12px; display: flex; gap: 8px;">
+        <button id="btnDownloadLatest" type="button" class="btn-manual-action primary-action">
+          ⬇ Download Latest Generated
+        </button>
+        <button id="btnDownloadAll" type="button" class="btn-manual-action">
+          ⬇ Download All Visible
+        </button>
+      </div>
+
+      <div class="note-box">
+        ⚙️ <b>Set Mode, Aspect &amp; Outputs in Flow:</b> The extension uses Flow's current UI mode and exports standard PNG data URLs.
+      </div>
+
+      <div class="grid-settings">
+        <div>
+          <label>Wait mode</label>
+          <select id="waitMode">
+            <option value="fast" selected>Fast (auto-wait)</option>
+            <option value="auto">Auto (wait + dl)</option>
+            <option value="fixed">Fixed delay</option>
+            <option value="manual">Manual (Next click)</option>
+          </select>
+        </div>
+        <div>
+          <label>Fixed delay (s)</label>
+          <input id="delaySec" type="number" value="45" min="2" />
+        </div>
+      </div>
+
+      <div class="checkbox-row" style="margin-top: 8px;">
+        <label><input id="autoDownload" type="checkbox" checked /> Auto-download generated media</label>
+      </div>
+      <div class="checkbox-row" id="upscaleWrap">
+        <label><input id="upscale" type="checkbox" /> Upscale images to 2048px</label>
+      </div>
+    </div>
+  </details>
+
+  <!-- Collapsible Activity Log -->
+  <details class="collapsible-card" open>
+    <summary class="collapsible-summary">📜 Activity Log</summary>
+    <div class="collapsible-content log-content">
+      <div id="log"></div>
+    </div>
+  </details>
+
+  <footer class="app-footer">
+    <span id="loaded" class="muted">Ready</span>
   </footer>
+
+  <!-- Full Image Preview Modal -->
+  <div id="imageModal" class="modal-overlay" style="display: none;">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <span id="modalTitle" class="modal-title">Generated Media</span>
+        <button id="modalCloseBtn" type="button" class="modal-close-btn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <img id="modalImg" src="" alt="Full preview" />
+      </div>
+      <div class="modal-footer">
+        <button id="modalDownloadBtn" type="button" class="btn-modal-dl">⬇ Download</button>
+        <button id="modalCloseActionBtn" type="button" class="btn-modal-close">Close</button>
+      </div>
+    </div>
+  </div>
 
   <script src="sidepanel.js"></script>
 </body>
