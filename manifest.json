@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Flow Batch Automation",
+  "version": "0.3.0",
+  "description": "Queue prompts into Google Flow, generate them one by one, and auto-download each result into a timestamped folder, named after Flow's own image captions.",
+  "permissions": ["sidePanel", "storage", "downloads", "scripting", "tabs", "debugger"],
+  "host_permissions": ["https://labs.google/*"],
+  "background": { "service_worker": "background.js" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "action": { "default_title": "Flow Batch Automation" },
+  "content_scripts": [
+    {
+      "matches": ["https://labs.google/fx/tools/flow*"],
+      "js": ["flow-adapter.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

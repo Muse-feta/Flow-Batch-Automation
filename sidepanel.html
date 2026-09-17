@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="sidepanel.css" />
+  <title>Flow Batch Automation</title>
+</head>
+<body>
+  <header>
+    <h1>Flow Batch Automation</h1>
+    <div id="loaded" class="muted">loading…</div>
+  </header>
+
+  <section class="card">
+    <div class="row">
+      <label>Source</label>
+      <select id="source">
+        <option value="paste" selected>Paste my own prompts</option>
+        <option value="bundled">Bundled 290 (collections)</option>
+      </select>
+    </div>
+
+    <div id="pasteBlock">
+      <label>Prompts — one per line (blank line = separator for multi-line prompts)</label>
+      <textarea id="pasteText" rows="8" placeholder="Paste one prompt per line, e.g.
+A photorealistic 3 inch boxed cushion in emerald velvet on a window seat...
+A macro close-up of the velvet pile, soft raking light...
+
+(Or separate multi-line prompts with a blank line.)"></textarea>
+      <div class="row">
+        <label>Name prefix</label>
+        <input id="prefix" type="text" placeholder="optional, e.g. velvet  → used in progress + filenames" />
+      </div>
+    </div>
+
+    <div id="bundledBlock" style="display:none">
+      <div class="row">
+        <label>Collections</label>
+        <select id="collection"><option value="*">All (29)</option></select>
+      </div>
+      <div class="row">
+        <label>Shots</label>
+        <input id="shots" type="text" placeholder="e.g. 1,2,5 or 1-3 (blank = all 10)" />
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="note">
+      ⚙️ <b>Set Mode, Aspect, Outputs &amp; Model in Flow itself</b> before you start —
+      click the model chip (e.g. “🍌 Nano&nbsp;Banana&nbsp;2 · 1x”) in Flow’s prompt bar
+      and pick Image/Video, aspect, outputs and model there. The extension uses
+      whatever Flow is set to and saves however many images Flow produces.
+    </div>
+    <div class="grid2">
+      <div><label>Wait mode</label>
+        <select id="waitMode">
+          <option value="fast" selected>Fast (waits per image)</option>
+          <option value="auto">Auto (wait + download each)</option>
+          <option value="fixed">Fixed delay</option>
+          <option value="manual">Manual (I click Next)</option>
+        </select>
+      </div>
+      <div><label>Fixed delay (s)</label>
+        <input id="delaySec" type="number" value="45" min="2" title="Used only in Fixed delay mode" />
+      </div>
+    </div>
+    <div class="row" style="margin-top:4px">
+      <label style="width:auto"><input id="autoDownload" type="checkbox" checked style="width:auto;margin-right:6px" />Auto-download → Downloads/Flow-Automation/&lt;timestamp&gt;/&lt;folder&gt;/</label>
+    </div>
+    <div class="row" id="upscaleWrap">
+      <label style="width:auto"><input id="upscale" type="checkbox" style="width:auto;margin-right:6px" />Upscale images to 2048px (interpolated — bigger file, not extra detail)</label>
+    </div>
+  </section>
+
+  <section class="actions">
+    <button id="start" class="primary">Start</button>
+    <button id="pause" disabled>Pause</button>
+    <button id="next" disabled>Next ▶</button>
+    <button id="stop" disabled>Stop</button>
+  </section>
+
+  <section class="card">
+    <div class="row"><strong>Queue:</strong> <span id="queueCount">0</span> prompts</div>
+    <progress id="bar" value="0" max="1"></progress>
+    <div id="now" class="muted">idle</div>
+  </section>
+
+  <section class="card log">
+    <div id="log"></div>
+  </section>
+
+  <footer class="muted">
+    Open a Flow <b>project</b>tab first. Selectors live in <code>flow-adapter.js</code>.
+  </footer>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

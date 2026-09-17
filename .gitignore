@@ -1,0 +1,7 @@
+# Business data + private tooling — not part of the extension
+prompts.json
+build_prompts_json.py
+upload_flow_images.py
+import_lists/
+
+.DS_Store
