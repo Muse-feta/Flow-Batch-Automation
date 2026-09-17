@@ -105,20 +105,46 @@
   // empty (NOT a placeholder attr / aria-label). (Recalibrated live, July 2026.)
   function findPromptBox() {
     const ph = "what do you want to create";
-    // 1) the composer editor, matched by placeholder text or aria/data-placeholder
-    const editors = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')].filter(visible);
-    let el = editors.find((e) =>
-      norm(e.getAttribute("aria-label") || e.dataset.placeholder || "").includes(ph) ||
-      norm(e.textContent).includes(ph)
+
+    // 1) Check visible <textarea>, <input>, or [contenteditable="true"] matching placeholder or aria-label
+    const editables = [
+      ...document.querySelectorAll('textarea, input, [contenteditable="true"], [role="textbox"]')
+    ].filter(visible);
+
+    let el = editables.find((e) => {
+      const aria = norm(e.getAttribute("aria-label") || "");
+      const placeholder = norm(e.getAttribute("placeholder") || e.placeholder || e.dataset.placeholder || "");
+      const text = norm(e.textContent || "");
+      return aria.includes(ph) || placeholder.includes(ph) || text.includes(ph);
+    });
+    if (el) return el;
+
+    // 2) If not found directly, locate any visible label containing "what do you want to create",
+    // traverse to its closest container (div, form, or div[role="region"]), and query for the inner textarea or [contenteditable="true"]
+    const labels = [...document.querySelectorAll("label, span, p, div")].filter(
+      (e) => visible(e) && norm(e.textContent).includes(ph)
     );
-    if (el) return el;
-    // 2) classic textarea / input with the placeholder attribute
-    el = [...document.querySelectorAll("textarea, input[type=text]")].find((e) => norm(e.placeholder).includes(ph));
-    if (el) return el;
-    // 3) last resort: the lowest visible editor (composer sits at the bottom)
-    const candidates = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')]
+
+    for (const lbl of labels) {
+      let cur = lbl.parentElement;
+      while (cur && cur !== document.body) {
+        if (cur.matches('form, [role="region"], div')) {
+          const inner = [
+            ...cur.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input')
+          ].find(visible);
+          if (inner) return inner;
+        }
+        cur = cur.parentElement;
+      }
+    }
+
+    // 3) Fallback: Select the lowest visible textarea or [contenteditable="true"] on the screen based on bounding rect coordinates
+    const candidates = [
+      ...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')
+    ]
       .filter(visible)
-      .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+      .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+
     return candidates[0] || null;
   }
 
@@ -167,7 +193,14 @@
   // aspect/count labels repeat across sections, so controls are scoped by the
   // vertical band between a section header and the next header / Save button.
   function findTuneButton() {
-    return [...document.querySelectorAll("button")].find((b) => visible(b) && norm(b.textContent).includes("tune")) || null;
+    return (
+      [...document.querySelectorAll('button, [role="button"]')].find((b) => {
+        if (!visible(b)) return false;
+        const text = norm(b.textContent);
+        const aria = norm(b.getAttribute("aria-label") || "");
+        return text.includes("tune") || aria.includes("tune") || aria.includes("settings");
+      }) || null
+    );
   }
   function settingsPanel() {
     const h = [...document.querySelectorAll("*")].find((e) => e.children.length === 0 && norm(e.textContent) === "agent settings");
@@ -181,13 +214,13 @@
   async function openSettings() {
     if (settingsOpen()) return true;
     const t = findTuneButton();
-    if (!t) throw new Error("settings (tune) button not found");
+    if (!t) return false;
     for (let attempt = 0; attempt < 3; attempt++) {
       if (settingsOpen()) return true;
       singleClick(t); // toggle — MUST be a single activation, not robustClick
       for (let i = 0; i < 12; i++) { await sleep(150); if (settingsOpen()) return true; }
     }
-    throw new Error("Agent settings panel did not open");
+    return settingsOpen();
   }
 
   // Buttons within one section's vertical band. `section` is "image" | "video".
@@ -270,39 +303,137 @@
 
   // Apply mode/aspect/count/model in one panel open→Save→close cycle.
   async function configure(cfg) {
-    await openSettings();
-    setConfirm("never"); // don't stall an unattended batch waiting for confirmation
-    await sleep(120);
-    const section = cfg.mode === "video" ? "video" : "image";
-    if (cfg.aspect) await setAspectFor(section, cfg.aspect);
-    if (cfg.count) await setCountFor(section, cfg.count);
-    if (cfg.model) await setModelFor(section, cfg.model);
-    await saveSettings();
-    await closeSettings();
-    return true;
+    try {
+      const t = findTuneButton();
+      if (!t) return false;
+      const opened = await openSettings();
+      if (!opened) return false;
+      setConfirm("never"); // don't stall an unattended batch waiting for confirmation
+      await sleep(120);
+      const section = cfg.mode === "video" ? "video" : "image";
+      if (cfg.aspect) await setAspectFor(section, cfg.aspect);
+      if (cfg.count) await setCountFor(section, cfg.count);
+      if (cfg.model) await setModelFor(section, cfg.model);
+      await saveSettings();
+      await closeSettings();
+      return true;
+    } catch (e) {
+      console.warn("[ZIPCushions Flow] configure settings skipped:", e);
+      return false;
+    }
   }
 
   // Set ONLY "Confirm before generating → Never" (leave Mode/Aspect/Outputs/Model
-  // to the user in Flow). Without this the Agent asks for confirmation and never
-  // auto-generates, so a batch run just times out with nothing saved. Returns
-  // { ok, changed } — changed=false means it was already Never (or radio absent).
+  // to the user in Flow). If the UI uses a pill/chip without a tune button, or if
+  // opening settings fails, resolve gracefully with { ok: true, skipped: true }
+  // to allow the batch run to continue unhindered.
   async function ensureAutoGenerate() {
-    await openSettings();
-    const found = setConfirm("never");
-    await sleep(120);
-    if (found) { await saveSettings(); }
-    await closeSettings();
-    return { ok: true, found };
+    try {
+      const tuneBtn = findTuneButton();
+      if (!tuneBtn) {
+        return { ok: true, skipped: true };
+      }
+      const opened = await openSettings();
+      if (!opened && !settingsOpen()) {
+        return { ok: true, skipped: true };
+      }
+      const found = setConfirm("never");
+      await sleep(120);
+      if (found) { await saveSettings(); }
+      await closeSettings();
+      return { ok: true, found };
+    } catch (e) {
+      console.warn("[ZIPCushions Flow] settings (tune) panel logic skipped:", e);
+      return { ok: true, skipped: true, error: String(e && e.message || e) };
+    }
   }
 
   // ---- submit --------------------------------------------------------------
+  function isStopButton(b) {
+    if (!b) return false;
+    const t = norm(b.textContent);
+    const a = norm(b.getAttribute("aria-label") || "");
+    const title = norm(b.getAttribute("title") || "");
+    return /(^|[^a-z])stop([^a-z]|$)/.test(t) || a.includes("stop") || title.includes("stop");
+  }
+
   function findSubmitButton() {
-    // The submit control is a button whose Material icon ligature is "arrow_forward"
-    // (its full text reads "arrow_forwardcreate"). Right-most such button. (Confirmed live.)
-    const btns = [...document.querySelectorAll("button")].filter(
-      (b) => visible(b) && norm(b.textContent).includes("arrow_forward")
-    );
-    if (btns.length) return btns.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
+    // 1) Standard buttons with "arrow_forward" text/ligature or aria-label
+    const arrowBtns = [...document.querySelectorAll('button, [role="button"]')].filter((b) => {
+      if (!visible(b) || isStopButton(b)) return false;
+      const text = norm(b.textContent);
+      const aria = norm(b.getAttribute("aria-label") || "");
+      const title = norm(b.getAttribute("title") || "");
+      return text.includes("arrow_forward") || aria.includes("arrow_forward") || title.includes("arrow_forward");
+    });
+    if (arrowBtns.length) {
+      return arrowBtns.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
+    }
+
+    // 2) Semantic submit/send/generate/run/create buttons
+    const semanticBtns = [...document.querySelectorAll('button, [role="button"]')].filter((b) => {
+      if (!visible(b) || isStopButton(b)) return false;
+      const aria = norm((b.getAttribute("aria-label") || "") + " " + (b.getAttribute("title") || ""));
+      return /submit|send|generate|run|create prompt/.test(aria);
+    });
+    if (semanticBtns.length) {
+      return semanticBtns.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
+    }
+
+    // 3) SVG / icon-based submit arrow situated on the far-right of the prompt dock
+    const box = findPromptBox();
+    if (box) {
+      const boxRect = box.getBoundingClientRect();
+
+      // Find dock or composer container enclosing the prompt box
+      let container = box.closest('form, [role="region"]');
+      if (!container) {
+        let cur = box.parentElement;
+        while (cur && cur !== document.body) {
+          if (cur.querySelectorAll('button, [role="button"]').length > 0) {
+            container = cur;
+            break;
+          }
+          cur = cur.parentElement;
+        }
+      }
+
+      // Collect buttons in container or near the prompt box vertically
+      let dockBtns = [];
+      if (container) {
+        dockBtns = [...container.querySelectorAll('button, [role="button"]')].filter(visible);
+      }
+      if (!dockBtns.length) {
+        dockBtns = [...document.querySelectorAll('button, [role="button"]')].filter((b) => {
+          if (!visible(b)) return false;
+          const r = b.getBoundingClientRect();
+          return Math.abs(r.top - boxRect.top) < 100 || (r.bottom >= boxRect.top && r.top <= boxRect.bottom);
+        });
+      }
+
+      // Filter out non-submit buttons (stop, tune, settings, attachments, close)
+      const validBtns = dockBtns.filter((b) => {
+        if (isStopButton(b)) return false;
+        const text = norm(b.textContent);
+        const aria = norm((b.getAttribute("aria-label") || "") + " " + (b.getAttribute("title") || ""));
+        if (text.includes("tune") || aria.includes("tune") || aria.includes("settings")) return false;
+        if (aria.includes("attach") || aria.includes("upload") || text.includes("attach_file")) return false;
+        if (text.includes("close") || aria.includes("close") || aria.includes("dismiss")) return false;
+        return true;
+      });
+
+      // Prefer buttons containing an SVG (icon-based submit arrows)
+      const svgBtns = validBtns.filter((b) => b.querySelector("svg"));
+      if (svgBtns.length) {
+        return svgBtns.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
+      }
+
+      // Fallback: far-right button in the prompt dock
+      if (validBtns.length) {
+        return validBtns.sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
+      }
+    }
+
     return null;
   }
 
@@ -320,25 +451,99 @@
   }
 
   // ---- generation state ----------------------------------------------------
-  // A generated still is an <img> whose src is Flow's media endpoint
-  // (…/media.getMediaUrlRedirect?name=…) — NOT the tiny account avatar.
-  // (Confirmed against live Flow, June 2026.)
+  // Helper to filter out user avatars, system icons, and small UI thumbnails
+  function isAvatarOrIcon(el, url) {
+    const s = url || (el && (el.src || el.currentSrc)) || "";
+    if (/\/a[/-]/i.test(s) || /googleusercontent\.com\/a\//i.test(s) || /lh\d\.googleusercontent\.com\/a\//i.test(s)) return true;
+    if (el && el.getBoundingClientRect) {
+      const r = el.getBoundingClientRect();
+      const nw = el.naturalWidth || 0, nh = el.naturalHeight || 0;
+      const w = nw || r.width || el.width || 0;
+      const h = nh || r.height || el.height || 0;
+      if ((w > 0 && w < 150) || (h > 0 && h < 150)) return true;
+    }
+    const cls = (el && el.className) || "";
+    if (typeof cls === "string" && /avatar|profile|icon|badge|logo/i.test(cls)) return true;
+    const alt = el && el.getAttribute ? (el.getAttribute("alt") || "") : "";
+    if (/avatar|profile/i.test(alt)) return true;
+    return false;
+  }
+
   function isGenImg(i) {
-    const s = i.src || "";
-    if (i.naturalWidth && i.naturalWidth < 220) return false; // excludes avatars/icons (32–96px)
-    return /getMediaUrlRedirect/.test(s) ||
-      /labs\.google\/fx\/api\/.*media/i.test(s) ||
-      /\/fx\/.*\/(media|image|result)/i.test(s) ||
-      (/(lh3|lh4|lh5|lh6)\.googleusercontent/.test(s) && !/\/a[/-]/.test(s)) ||
-      (/googleusercontent/.test(s) && !/\/a\//.test(s));
+    if (!i) return false;
+    const s = (i.src || i.currentSrc || "").trim();
+    if (!s) return false;
+    if (isAvatarOrIcon(i, s)) return false;
+
+    // Check size if already loaded/rendered
+    const r = i.getBoundingClientRect ? i.getBoundingClientRect() : { width: 0, height: 0 };
+    const w = i.naturalWidth || r.width || i.width || 0;
+    const h = i.naturalHeight || r.height || i.height || 0;
+    if (w > 0 && w < 150) return false;
+    if (h > 0 && h < 150) return false;
+
+    // Known media endpoints / protocols
+    if (/getMediaUrlRedirect/.test(s)) return true;
+    if (/(labs|flow)\.google(\.com)?\/.*(media|image|result|api)/i.test(s)) return true;
+    if (/\/fx\/.*\/(media|image|result)/i.test(s)) return true;
+    if (s.startsWith("blob:") || s.startsWith("data:")) return true;
+    if (/googleusercontent\.com/i.test(s) && !/\/a[/-]/.test(s)) return true;
+
+    // Any other visible card/canvas image on page with valid dimensions
+    return (w >= 150 || w === 0) && (h >= 150 || h === 0);
   }
+
   function genImgs() {
-    return [...document.querySelectorAll("img")].filter(isGenImg); // DOM order = newest first
+    // 1) Search for all matching <img> elements
+    const imgs = [...document.querySelectorAll("img")].filter((i) => visible(i) && isGenImg(i));
+    if (imgs.length > 0) return imgs;
+
+    // 2) Fallback: Check if tiles use <canvas>
+    const canvases = [...document.querySelectorAll("canvas")].filter((c) => {
+      if (!visible(c)) return false;
+      const r = c.getBoundingClientRect();
+      return r.width >= 150 && r.height >= 150;
+    });
+    if (canvases.length > 0) {
+      const items = [];
+      for (const c of canvases) {
+        try {
+          const dataUrl = c.toDataURL("image/png");
+          if (dataUrl && dataUrl.length > 100) {
+            items.push({ src: dataUrl, element: c });
+          }
+        } catch (e) {}
+      }
+      if (items.length > 0) return items;
+    }
+
+    // 3) Fallback: Check if tiles use CSS background-image
+    const bgEls = [...document.querySelectorAll("div, span, section, article")].filter((el) => {
+      if (!visible(el)) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 150 || r.height < 150) return false;
+      const bg = getComputedStyle(el).backgroundImage || "";
+      return bg && bg.startsWith("url(") && !isAvatarOrIcon(el, bg);
+    });
+    if (bgEls.length > 0) {
+      const items = [];
+      for (const el of bgEls) {
+        const bg = getComputedStyle(el).backgroundImage;
+        const m = bg.match(/url\(['"]?(.*?)['"]?\)/);
+        if (m && m[1]) {
+          items.push({ src: m[1], element: el });
+        }
+      }
+      if (items.length > 0) return items;
+    }
+
+    return [];
   }
+
   // The caption Flow shows on a tile (e.g. "Golden retriever puppy sitting park").
-  // Rendered as a leaf element near the <img>; skip icon ligatures / %-badges.
   function mediaCaption(img) {
-    let el = img;
+    let el = img && (img.element || img);
+    if (!el || !el.parentElement) return "";
     for (let i = 0; i < 8 && el.parentElement; i++) {
       el = el.parentElement;
       const leaf = [...el.querySelectorAll("*")].find((e) => {
@@ -350,14 +555,21 @@
     }
     return "";
   }
+
   // Generated stills as {src, name}, newest-first — name is Flow's own caption.
   function genImgItems() {
-    return genImgs().map((img) => ({ src: img.src, name: mediaCaption(img) }));
+    return genImgs().map((item) => {
+      const el = item.element || item;
+      const src = item.src || el.currentSrc || el.src || "";
+      return { src, name: mediaCaption(el) };
+    });
   }
+
   function genVideos() {
     // generated videos render as <video> (src may be the media endpoint or blob)
     return [...document.querySelectorAll("video")].map((v) => v.currentSrc || v.src).filter(Boolean);
   }
+
   function countMedia() {
     return genImgs().length;
   }
@@ -368,35 +580,62 @@
       (e) => visible(e) && /^\d{1,3}%$/.test((e.textContent || "").trim())
     ).length;
   }
+
   // The Agent works one request at a time: it "thinks" (Defining the Goal…) then
   // generates. During BOTH phases the composer swaps its send arrow for a Stop
-  // control — so treat that (plus %-badges / spinners) as busy. This is what lets
-  // the runner wait for each prompt to finish before submitting the next.
+  // control — so treat that (plus %-badges / spinners) as busy.
   function isGenerating() {
     if (genCount() > 0) return true;
     if (document.querySelector('[role="progressbar"], [aria-busy="true"]')) return true;
     // a Stop control anywhere in the lower composer means the agent is working
-    const stop = [...document.querySelectorAll("button")].some((b) => {
+    const stop = [...document.querySelectorAll('button, [role="button"]')].some((b) => {
       if (!visible(b) || b.getBoundingClientRect().top < 300) return false;
-      const t = norm(b.textContent), a = norm(b.getAttribute("aria-label") || "");
-      return /(^|[^a-z])stop([^a-z]|$)/.test(t) || a.includes("stop");
+      return isStopButton(b);
     });
     if (stop) return true;
     // fallback: the composer is present but its send arrow is gone => still busy
     return !!(findPromptBox() && !findSubmitButton());
   }
 
-  // ---- download (Phase 2) --------------------------------------------------
+  // Convert blob URL or DOM image to data URL inside page context
+  async function blobToDataUrl(url) {
+    if (!url) throw new Error("No URL provided");
+    if (url.startsWith("data:")) return url;
+
+    // Method A: Fetch as Blob
+    try {
+      const resp = await fetch(url);
+      const blob = await resp.blob();
+      const reader = new FileReader();
+      const dataUrl = await new Promise((resolve, reject) => {
+        reader.onloadend = () => resolve(reader.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+      return dataUrl;
+    } catch (fetchErr) {
+      // Method B: Draw from existing DOM <img> onto canvas
+      const imgEl = [...document.querySelectorAll("img")].find((i) => i.src === url || i.currentSrc === url);
+      if (!imgEl) throw fetchErr;
+      const canvas = document.createElement("canvas");
+      canvas.width = imgEl.naturalWidth || imgEl.width || 512;
+      canvas.height = imgEl.naturalHeight || imgEl.height || 512;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(imgEl, 0, 0);
+      return canvas.toDataURL("image/png");
+    }
+  }
+
+  // ---- download (Phase 2 fallback) -----------------------------------------
   // Confirmed path (June 2026): hover a media tile -> click its ⋮ (more) button
   // -> click the "Download" item in the menu. Newest tiles render first in the grid.
   function mediaTiles() {
     // each tile contains a generated <img> and a caption; map img -> tile container
-    const imgs = genImgs();
+    const items = genImgs();
     const tiles = [];
     const seen = new Set();
-    for (const img of imgs) {
-      // climb to the smallest ancestor that also holds a button (the hover controls)
-      let el = img;
+    for (const item of items) {
+      let el = item.element || item;
       for (let i = 0; i < 8 && el.parentElement; i++) {
         el = el.parentElement;
         if (el.querySelector("button")) break;
@@ -466,8 +705,12 @@
             await submit();
             return sendResponse({ ok: true, mediaBefore: before });
           }
+          case "typePrompt": {
+            await typePrompt(msg.text);
+            return sendResponse({ ok: true });
+          }
           case "focusPrompt": {
-            // focus + clear the contenteditable, place caret, return its center
+            // focus + clear the contenteditable / textarea, place caret, return its center
             // point so the background can type via the debugger (trusted input).
             // Wait for the box first: the Agent removes it while busy, so this is
             // what serialises the batch (next prompt waits for the agent to idle).
@@ -475,11 +718,20 @@
             if (!box) return sendResponse({ ok: false, error: "prompt box not found (agent still busy?)" });
             box.focus();
             try {
-              const sel = getSelection(), r = document.createRange();
-              r.selectNodeContents(box); sel.removeAllRanges(); sel.addRange(r);
-              document.execCommand("delete");
-              const r2 = document.createRange(); r2.selectNodeContents(box); r2.collapse(false);
-              sel.removeAllRanges(); sel.addRange(r2);
+              if (box.tagName === "TEXTAREA" || box.tagName === "INPUT" || box.value !== undefined) {
+                box.value = "";
+                box.dispatchEvent(new Event("input", { bubbles: true }));
+                box.dispatchEvent(new Event("change", { bubbles: true }));
+                if (typeof box.setSelectionRange === "function") {
+                  box.setSelectionRange(0, 0);
+                }
+              } else {
+                const sel = getSelection(), r = document.createRange();
+                r.selectNodeContents(box); sel.removeAllRanges(); sel.addRange(r);
+                document.execCommand("delete");
+                const r2 = document.createRange(); r2.selectNodeContents(box); r2.collapse(false);
+                sel.removeAllRanges(); sel.addRange(r2);
+              }
             } catch (e) {}
             const rect = box.getBoundingClientRect();
             return sendResponse({ ok: true, before: countMedia(), beforeVid: genVideos().length, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
@@ -503,7 +755,11 @@
           }
           case "readPrompt": {
             const box = findPromptBox();
-            return sendResponse({ ok: true, text: box ? norm(box.textContent) : "" });
+            let val = "";
+            if (box) {
+              val = box.value !== undefined ? box.value : (box.innerText || box.textContent || "");
+            }
+            return sendResponse({ ok: true, text: norm(val) });
           }
           case "dismiss": {
             for (let i = 0; i < 2; i++) {
@@ -523,10 +779,42 @@
             return sendResponse({ ok: true, generating: isGenerating(), genCount: genCount(), media: countMedia(), videos: genVideos().length });
           case "mediaSrcs":
             // both generated images and videos, newest-first
-            return sendResponse({ ok: true, images: genImgs().map((i) => i.src), videos: genVideos() });
+            return sendResponse({ ok: true, images: genImgItems().map((i) => i.src), videos: genVideos() });
           case "mediaItems":
             // generated stills as {src, name}, newest-first (name = Flow's caption)
             return sendResponse({ ok: true, images: genImgItems(), videos: genVideos() });
+          case "fetchBlobAsDataUrl": {
+            try {
+              const url = msg.url;
+              // If it is already a data URL, return directly
+              if (url.startsWith("data:")) return sendResponse({ ok: true, dataUrl: url });
+
+              // Method A: Fetch as Blob
+              try {
+                const resp = await fetch(url);
+                const blob = await resp.blob();
+                const reader = new FileReader();
+                const dataUrl = await new Promise((resolve, reject) => {
+                  reader.onloadend = () => resolve(reader.result);
+                  reader.onerror = reject;
+                  reader.readAsDataURL(blob);
+                });
+                return sendResponse({ ok: true, dataUrl });
+              } catch (fetchErr) {
+                // Method B: Draw from existing DOM <img> onto canvas
+                const imgEl = [...document.querySelectorAll("img")].find((i) => i.src === url || i.currentSrc === url);
+                if (!imgEl) throw fetchErr;
+                const canvas = document.createElement("canvas");
+                canvas.width = imgEl.naturalWidth || imgEl.width || 512;
+                canvas.height = imgEl.naturalHeight || imgEl.height || 512;
+                const ctx = canvas.getContext("2d");
+                ctx.drawImage(imgEl, 0, 0);
+                return sendResponse({ ok: true, dataUrl: canvas.toDataURL("image/png") });
+              }
+            } catch (err) {
+              return sendResponse({ ok: false, error: err.message });
+            }
+          }
           case "upscale": {
             // fetch the image (CORS-ok), draw to a canvas at `size` longest-side,
             // return a JPEG data URL. Uses a blob source so the canvas isn't tainted.

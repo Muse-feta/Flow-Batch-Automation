@@ -65,34 +65,76 @@ function parsePasted(raw) {
   return text.split("\n").map((l) => toItem(l.trim())).filter((it) => it.prompt);
 }
 
+// Extract timestamp tag formatted like #2-06, 2-06, 0-00, 0-15, 1-05, etc.
+// Regex matcher: /^(?:#?\s*)(\d+[-_]\d+)/
+function parseTimestampTag(text, fallbackIndex) {
+  const raw = String(text || "").trim();
+  const match = raw.match(/^(?:#?\s*)(\d+[-_]\d+)/);
+  if (match) {
+    const customTag = match[1];
+    const promptText = raw.replace(/^(?:#?\s*)\d+[-_]\d+[\s\:\-\.]*/i, "").trim();
+    return { customTag, promptText };
+  }
+  return {
+    customTag: String(fallbackIndex).padStart(2, "0"),
+    promptText: raw,
+  };
+}
+
 function buildQueue() {
+  let rawList = [];
   if ($("source").value === "paste") {
     const prefix = ($("prefix").value || "custom").trim() || "custom";
-    return parsePasted($("pasteText").value).map((it, i) => ({
+    rawList = parsePasted($("pasteText").value).map((it, i) => ({
       collection: prefix,
       listing_id: null,
       n: i + 1,
       label: it.label || "",
       prompt: it.prompt,
     }));
-  }
-  const col = $("collection").value;
-  const shots = parseShots($("shots").value);
-  const queue = [];
-  for (const c of DATA.collections) {
-    if (col !== "*" && c.collection !== col) continue;
-    for (const p of c.prompts) {
-      if (shots && !shots.has(p.n)) continue;
-      queue.push({
-        collection: c.collection,
-        listing_id: c.listing_id,
-        n: p.n,
-        label: p.label,
-        prompt: p.prompt,
-      });
+  } else {
+    const col = $("collection").value;
+    const shots = parseShots($("shots").value);
+    for (const c of DATA.collections) {
+      if (col !== "*" && c.collection !== col) continue;
+      for (const p of c.prompts) {
+        if (shots && !shots.has(p.n)) continue;
+        rawList.push({
+          collection: c.collection,
+          listing_id: c.listing_id,
+          n: p.n,
+          label: p.label,
+          prompt: p.prompt,
+        });
+      }
     }
   }
-  return queue;
+
+  return rawList.map((it, i) => {
+    // 1) Try prompt text for timestamp prefix like #2-06, 0-00, 0-04, etc.
+    let parsed = parseTimestampTag(it.prompt, i + 1);
+    let customTag = parsed.customTag;
+    let cleanPrompt = parsed.promptText;
+
+    // 2) If not in prompt, check label (e.g. from markdown headings like ### #2-06)
+    if ((!customTag || customTag === String(i + 1).padStart(2, "0")) && it.label) {
+      const fromLabel = parseTimestampTag(it.label, i + 1);
+      if (fromLabel.customTag && fromLabel.customTag !== String(i + 1).padStart(2, "0")) {
+        customTag = fromLabel.customTag;
+      }
+    }
+
+    return {
+      collection: it.collection,
+      listing_id: it.listing_id,
+      n: i + 1,
+      label: it.label || "",
+      customTag,
+      rawPrompt: it.prompt,
+      prompt: cleanPrompt || it.prompt,
+      promptText: cleanPrompt || it.prompt,
+    };
+  });
 }
 
 function cfgFromUI() {
@@ -108,11 +150,14 @@ function cfgFromUI() {
   };
 }
 
+const btnNext = $("btnNext") || $("next");
+let CURRENT_JOB = null;
+
 function setRunning(on, manual = false) {
   $("start").disabled = on;
   $("pause").disabled = !on;
   $("stop").disabled = !on;
-  $("next").disabled = !manual;
+  if (btnNext) btnNext.disabled = !on; // Enabled whenever running or paused!
   document.querySelectorAll("select,input").forEach((e) => (e.disabled = on));
 }
 
@@ -192,35 +237,101 @@ $("pause").addEventListener("click", async () => {
   const paused = $("pause").textContent === "Pause";
   await chrome.runtime.sendMessage({ type: paused ? "pause" : "resume" });
   $("pause").textContent = paused ? "Resume" : "Pause";
+  if (btnNext) btnNext.disabled = false;
 });
-$("next").addEventListener("click", () => chrome.runtime.sendMessage({ type: "manualNext" }));
+
+if (btnNext) {
+  btnNext.addEventListener("click", async () => {
+    btnNext.style.border = "";
+    btnNext.style.boxShadow = "";
+    logLine("Skipping to next prompt ▶...", "ok");
+    await chrome.runtime.sendMessage({ type: "skipNext", cmd: "manualNext" });
+  });
+}
+
 $("stop").addEventListener("click", async () => {
   await chrome.runtime.sendMessage({ type: "stop" });
   setRunning(false);
   logLine("Stopped.", "warn");
 });
 
+$("btnDownloadLatest").addEventListener("click", async () => {
+  logLine("Requesting latest generated image...", "ok");
+  const customTag = (CURRENT_JOB && CURRENT_JOB.customTag) || "";
+  const resp = await chrome.runtime.sendMessage({
+    type: "downloadLatestManual",
+    cmd: "downloadLatestManual",
+    customTag,
+  });
+  if (resp && resp.ok) {
+    const name = resp.filename ? resp.filename.split("/").pop() : (customTag ? customTag + ".png" : "image.png");
+    logLine(`Downloading latest image: ${name}...`, "ok");
+  } else {
+    logLine("Download failed: " + ((resp && resp.error) || "no media found"), "err");
+  }
+  // Highlight and enable Next button so user can advance immediately
+  if (btnNext) {
+    btnNext.disabled = false;
+    btnNext.style.border = "2px solid #2563eb";
+    btnNext.style.boxShadow = "0 0 10px rgba(37, 99, 235, 0.7)";
+    btnNext.focus();
+  }
+});
+
+$("btnDownloadAll").addEventListener("click", async () => {
+  logLine("Requesting download of all visible images...", "ok");
+  const resp = await chrome.runtime.sendMessage({ type: "downloadAllManual", cmd: "downloadAllManual" });
+  if (resp && resp.ok) {
+    logLine(`Downloading all visible media (${resp.count || 0} items)...`, "ok");
+  } else {
+    logLine("Download all failed: " + ((resp && resp.error) || "no media found"), "err");
+  }
+});
+
 chrome.runtime.onMessage.addListener((m) => {
   if (m.type !== "progress") return;
   switch (m.kind) {
     case "start":
-      $("now").textContent = `▶ ${m.index + 1}/${m.total}  ${m.job.collection} #${m.job.n} (${m.job.label})`;
+      CURRENT_JOB = m.job;
+      const tagPrefix = m.job && m.job.customTag ? `[${m.job.customTag}] ` : "";
+      $("now").textContent = `▶ ${m.index + 1}/${m.total}  ${tagPrefix}${m.job.collection} #${m.job.n}`;
       $("bar").value = m.index;
+      if (btnNext) btnNext.disabled = false;
       break;
     case "done":
-      logLine(`✓ ${m.job.collection} #${m.job.n}`, "ok");
+      const doneTag = m.job ? (m.job.customTag || m.job.n) : "done";
+      logLine(`✓ ${doneTag} (${m.job ? m.job.collection : ""})`, "ok");
       $("bar").value = m.index + 1;
-      $("next").disabled = true;
+      if (btnNext) btnNext.disabled = false;
       break;
     case "await-manual":
-      $("next").disabled = false;
+      if (btnNext) btnNext.disabled = false;
       $("now").textContent += "  — waiting: click Next when ready";
       break;
     case "info": logLine(m.message, "ok"); break;
     case "warn": logLine("⚠ " + m.message, "warn"); break;
-    case "error": logLine(`✗ ${m.job ? m.job.collection + " #" + m.job.n + ": " : ""}${m.message}`, "err"); break;
-    case "finished": $("now").textContent = "✅ Finished"; setRunning(false); logLine("All done.", "ok"); break;
-    case "stopped": $("now").textContent = "⏹ Stopped"; setRunning(false); break;
+    case "error": logLine(`✗ ${m.job ? (m.job.customTag || m.job.collection + " #" + m.job.n) + ": " : ""}${m.message}`, "err"); break;
+    case "finished":
+      CURRENT_JOB = null;
+      $("now").textContent = "✅ Finished";
+      setRunning(false);
+      if (btnNext) {
+        btnNext.disabled = true;
+        btnNext.style.border = "";
+        btnNext.style.boxShadow = "";
+      }
+      logLine("All done.", "ok");
+      break;
+    case "stopped":
+      CURRENT_JOB = null;
+      $("now").textContent = "⏹ Stopped";
+      setRunning(false);
+      if (btnNext) {
+        btnNext.disabled = true;
+        btnNext.style.border = "";
+        btnNext.style.boxShadow = "";
+      }
+      break;
   }
 });
 

@@ -14,35 +14,82 @@ const DEFAULTS = {
 };
 
 // Download one media URL with the given filename; optionally upscale images first.
-// Returns true only if Chrome accepted the download (id assigned, no lastError).
+// Handles http/https directly, converts blob: URLs in page context, and retries with
+// page-context dataURL if network/CORS fails.
 async function downloadOne(tabId, url, filename, upscale) {
   let dlUrl = url;
   if (upscale) {
     const up = await send(tabId, { cmd: "upscale", url, size: 2048 });
     if (up && up.ok && up.dataUrl) dlUrl = up.dataUrl;
   }
-  // Force our exact folder + name. These media URLs (getMediaUrlRedirect) send their
-  // own Content-Disposition, so without overriding via onDeterminingFilename Chrome
-  // drops the file in the Downloads ROOT under a server-chosen name. saveAs:false
-  // also stops the "ask where to save" dialog from ignoring the subfolder path.
-  PENDING_NAMES = [filename]; // full "folder/.../name.ext"
-  return await new Promise((res) => {
-    try {
-      chrome.downloads.download({ url: dlUrl, filename, conflictAction: "uniquify", saveAs: false }, (id) => {
-        res(!chrome.runtime.lastError && id != null);
-      });
-    } catch (e) { PENDING_NAMES = []; res(false); }
-  });
+
+  // If the URL is a blob: URL (Chrome downloads API cannot download foreign blobs),
+  // convert it to a data URL inside the page context first:
+  if (dlUrl.startsWith("blob:")) {
+    const bres = await send(tabId, { cmd: "fetchBlobAsDataUrl", url: dlUrl });
+    if (bres && bres.ok && bres.dataUrl) {
+      dlUrl = bres.dataUrl;
+    }
+  }
+
+  const doDownload = (targetUrl) => {
+    return new Promise((res) => {
+      PENDING_NAMES.push(filename);
+      try {
+        chrome.downloads.download(
+          { url: targetUrl, filename, conflictAction: "uniquify", saveAs: false },
+          (id) => {
+            if (chrome.runtime.lastError || id == null) {
+              const err = chrome.runtime.lastError ? chrome.runtime.lastError.message : "Download ID is null";
+              console.warn("[Flow Batch] chrome.downloads.download failed:", err, "targetUrl:", targetUrl ? targetUrl.slice(0, 100) : "empty");
+              const idx = PENDING_NAMES.indexOf(filename);
+              if (idx !== -1) PENDING_NAMES.splice(idx, 1);
+              res(false);
+            } else {
+              res(true);
+            }
+          }
+        );
+      } catch (e) {
+        console.warn("[Flow Batch] chrome.downloads.download exception:", e);
+        const idx = PENDING_NAMES.indexOf(filename);
+        if (idx !== -1) PENDING_NAMES.splice(idx, 1);
+        res(false);
+      }
+    });
+  };
+
+  let ok = await doDownload(dlUrl);
+
+  // If download failed (e.g. auth/CORS restriction on http/https URL),
+  // fetch as data URL within the tab session and retry:
+  if (!ok && !dlUrl.startsWith("data:")) {
+    console.log("[Flow Batch] Direct download failed, attempting fetchBlobAsDataUrl retry...");
+    const bres = await send(tabId, { cmd: "fetchBlobAsDataUrl", url });
+    if (bres && bres.ok && bres.dataUrl) {
+      ok = await doDownload(bres.dataUrl);
+    }
+  }
+
+  return ok;
 }
 
-// Save one result robustly: try the direct media URL first; if Chrome rejects it
-// (auth/redirect issues), fall back to Flow's own "Download" button via the debugger
-// (trusted), naming the file through PENDING_NAMES + onDeterminingFilename.
-async function saveMedia(tabId, tileIndex, url, base, ext, upscale, isVideo) {
+// Save one result robustly: direct download first, then page context dataURL, then UI menu fallback.
+async function saveMedia(tabId, tileIndex, url, filename, upscale, isVideo) {
   let ok = false;
-  if (url) { try { ok = await downloadOne(tabId, url, base + ext, upscale); } catch (e) {} }
+  if (url) {
+    try {
+      ok = await downloadOne(tabId, url, filename, upscale);
+    } catch (e) {
+      console.warn("[Flow Batch] direct download error:", e);
+    }
+  }
   if (!ok && !isVideo && tileIndex >= 0) {
-    try { ok = await cdpDownloadTile(tabId, tileIndex, base + ext); } catch (e) {}
+    try {
+      ok = await cdpDownloadTile(tabId, tileIndex, filename);
+    } catch (e) {
+      console.warn("[Flow Batch] cdpDownloadTile error:", e);
+    }
   }
   return ok;
 }
@@ -51,7 +98,13 @@ async function saveMedia(tabId, tileIndex, url, base, ext, upscale, isVideo) {
 let PENDING_NAMES = []; // FIFO of suggested filenames for upcoming Flow downloads
 
 function sanitize(s) {
-  return String(s || "").replace(/[\\/:*?"<>|]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 60);
+  let clean = String(s || "")
+    .replace(/[/\\?%*:|"<>]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^[._]+|[._]+$/g, "");
+  if (clean.length > 60) clean = clean.slice(0, 60).trim();
+  return clean;
 }
 // A filesystem-safe timestamp, e.g. "2026-07-16_1606-42" — used to give every
 // run its own download folder so results never mix with a previous run's images.
@@ -62,10 +115,12 @@ function stampNow() {
 }
 
 chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-  if (!PENDING_NAMES.length) return false; // not ours / nothing queued
-  const filename = PENDING_NAMES.shift(); // full "folder/.../name.ext" — overrides server name
-  suggest({ filename, conflictAction: "uniquify" });
-  return true;
+  if (PENDING_NAMES.length) {
+    const filename = PENDING_NAMES.shift(); // full "folder/.../name.ext"
+    suggest({ filename, conflictAction: "uniquify" });
+    return true;
+  }
+  return false;
 });
 
 let RUN = null; // { queue:[{collection,listing_id,n,label,prompt}], i, tabId, paused, stopped, cfg, log:[] }
@@ -142,6 +197,7 @@ async function cdpDownloadTile(tabId, index, filename) {
 }
 async function cdpType(tabId, x, y, text) {
   await dbgAttach(tabId);
+  try { await chrome.tabs.update(tabId, { active: true }); } catch (_) {}
   if (typeof x === "number") await cdpClick(tabId, x, y); // ensure the editor is focused (trusted)
   await dbgCmd(tabId, "Input.insertText", { text });     // trusted text insertion
 }
@@ -166,40 +222,72 @@ function emit(evt) {
 }
 
 async function findFlowTab() {
-  const tabs = await chrome.tabs.query({ url: "https://labs.google/fx/tools/flow*" });
-  return tabs[0] || null;
+  const tabs = await chrome.tabs.query({
+    url: ["https://labs.google/fx/tools/flow*", "https://flow.google.com/*"],
+  });
+  if (tabs && tabs.length) return tabs[0];
+  const allTabs = await chrome.tabs.query({});
+  return allTabs.find((t) => t.url && (/flow\.google\.com/i.test(t.url) || /labs\.google\/fx\/tools\/flow/i.test(t.url))) || null;
 }
 
-async function waitForCompletion(tabId, cfg, mediaBefore) {
+async function waitForCompletion(tabId, cfg, mediaBefore, beforeTopUrl) {
+  if (RUN.stopped || RUN.skipWait) return;
+
   if (cfg.waitMode === "manual") {
     RUN.awaitingManual = true;
     emit({ kind: "await-manual" });
-    while (RUN && RUN.awaitingManual && !RUN.stopped) await sleep(500);
-    return;
-  }
-  if (cfg.waitMode === "fixed") {
-    for (let s = 0; s < cfg.delaySec; s++) {
-      if (RUN.stopped) return;
-      await sleep(1000);
+    while (RUN && RUN.awaitingManual && !RUN.stopped && !RUN.skipWait) {
+      await sleep(250);
     }
     return;
   }
-  // auto: poll until TOTAL media (images + videos) grows past `mediaBefore` and
-  // generating clears, or timeout. Counting both types means we don't need to know
-  // in advance whether the user set Flow to Image or Video.
-  const deadline = Date.now() + cfg.pollTimeoutSec * 1000;
-  let grew = false;
-  await sleep(2500); // let the request kick off
-  while (Date.now() < deadline) {
-    if (RUN.stopped) return;
+
+  // Poll for generation to complete (stop button gone / agent idle)
+  const pollDeadline = Date.now() + (cfg.pollTimeoutSec || 240) * 1000;
+  let startedGenerating = false;
+
+  // Wait briefly (up to 3s) for generation to kick off
+  for (let s = 0; s < 6; s++) {
+    if (RUN.stopped || RUN.skipWait) return;
+    const st = await send(tabId, { cmd: "status" });
+    if (st.ok && st.generating) {
+      startedGenerating = true;
+      break;
+    }
+    await sleep(500);
+  }
+
+  // Wait until generation finishes (Stop button disappears / prompt box returns)
+  while (Date.now() < pollDeadline) {
+    if (RUN.stopped || RUN.skipWait) return;
     const st = await send(tabId, { cmd: "status" });
     if (st.ok) {
-      if ((st.media || 0) + (st.videos || 0) > mediaBefore) grew = true;
-      if (grew && !st.generating) { await sleep(1500); return; }
+      if (st.generating) {
+        startedGenerating = true;
+      } else if (startedGenerating || !st.generating) {
+        console.log("[Flow Batch] Generation finished (stop button cleared). Actively polling for new image...");
+        break;
+      }
     }
-    await sleep(2500);
+    await sleep(500);
   }
-  emit({ kind: "warn", message: "poll timeout — moving on" });
+
+  // Once generation finishes, poll every 500ms (up to 5s max) until res.images.length > beforeCount
+  // or until the top image URL updates:
+  const settleDeadline = Date.now() + 5000;
+  while (Date.now() < settleDeadline) {
+    if (RUN.stopped || RUN.skipWait) return;
+    const m = await send(tabId, { cmd: "mediaItems" });
+    if (m.ok) {
+      const curCount = (m.images || []).length + (m.videos || []).length;
+      const topUrl = (m.images && m.images[0] && m.images[0].src) || (m.videos && m.videos[0]) || "";
+      if (curCount > mediaBefore || (topUrl && topUrl !== beforeTopUrl)) {
+        console.log(`[Flow Batch] New image appeared! (Count: ${mediaBefore} -> ${curCount}). Immediately triggering download.`);
+        return;
+      }
+    }
+    await sleep(500);
+  }
 }
 
 async function runLoop() {
@@ -213,6 +301,7 @@ async function runLoop() {
   let ag = { ok: false };
   for (let a = 0; a < 3 && !ag.ok; a++) { ag = await send(tabId, { cmd: "autogen" }); if (!ag.ok) await sleep(700); }
   if (!ag.ok) emit({ kind: "warn", message: "couldn't set auto-generate — set 'Confirm before generating: Never' in Flow's tune (⚙) settings, or it may stall" });
+  else if (ag.skipped) emit({ kind: "info", message: "✓ Flow settings chip detected · continuing batch with current settings" });
   else emit({ kind: "info", message: "✓ auto-generate on · using Flow's Mode/Aspect/Outputs/Model" });
 
   // Connect trusted typing up front so failures are obvious (and not silent).
@@ -227,71 +316,155 @@ async function runLoop() {
     return;
   }
 
-  // Download the media a single job just produced. Called right after the job
-  // finishes, so its outputs are simply the newest `n` tiles (0 = newest) — no
-  // fragile indexing into the whole (accumulating) grid, and no risk of grabbing
-  // an older image. Everything lands in this run's own folder (RUN.runDir).
-  async function downloadJob(job, beforeImg, beforeVid) {
+  // Download the media a single job just produced. Compares media before and after to download new assets.
+  async function downloadJob(job, beforeMedia) {
     if (!cfg.autoDownload) return;
-    const coll = sanitize(job.collection) || "custom";
-    const nn = String(job.n).padStart(2, "0");
-    const fallbackLbl = sanitize(job.label) || sanitize(job.prompt.slice(0, 40)) || "img";
+    const tag = job.customTag || String(job.n).padStart(2, "0");
+
+    await sleep(250); // slight pause to ensure DOM handles final paint
+
     const mres = await send(tabId, { cmd: "mediaItems" });
-    const images = (mres.ok && mres.images) || []; // [{src,name}], newest-first
-    const videos = (mres.ok && mres.videos) || []; // [src], newest-first
-    // Save only what THIS job added — never fall back to an older file (guards the
-    // timeout case). We don't rely on a preset Outputs count: whatever Flow made,
-    // we save. Auto-detects image vs video from which list grew.
-    const newImg = Math.max(0, images.length - (beforeImg || 0));
-    const newVid = Math.max(0, videos.length - (beforeVid || 0));
-    const total = newImg + newVid;
-    if (total === 0) { emit({ kind: "warn", message: `no new media for #${job.n} — nothing saved (generation failed/timed out?)` }); return; }
+    const currentImages = (mres.ok && mres.images) || []; // [{src,name}], newest-first
+    const currentVideos = (mres.ok && mres.videos) || []; // [src], newest-first
+
+    const prevImages = (beforeMedia && beforeMedia.images) || [];
+    const prevVideos = (beforeMedia && beforeMedia.videos) || [];
+    const prevUrls = new Set(prevImages.map((i) => i.src).filter(Boolean).concat(prevVideos.filter(Boolean)));
+
+    // 1) Explicitly log number of images found before vs after generation
+    console.log(`[Flow Batch] #${job.n} (${tag}) Media count: before=${prevImages.length} img, ${prevVideos.length} vid vs after=${currentImages.length} img, ${currentVideos.length} vid`);
+    emit({
+      kind: "info",
+      message: `Media count: before=${prevImages.length} img → after=${currentImages.length} img`,
+    });
+
+    // 2) Find newly added items by URL difference
+    let newImgItems = currentImages.filter((i) => i.src && !prevUrls.has(i.src));
+    let newVidItems = currentVideos.filter((v) => v && !prevUrls.has(v));
+
+    // Fallback: if URL diff is empty but count increased, take newest items from top
+    if (newImgItems.length === 0 && currentImages.length > prevImages.length) {
+      newImgItems = currentImages.slice(0, currentImages.length - prevImages.length);
+    }
+    if (newVidItems.length === 0 && currentVideos.length > prevVideos.length) {
+      newVidItems = currentVideos.slice(0, currentVideos.length - prevVideos.length);
+    }
+
+    // 3) DO NOT abort if the diff returns 0 items: grab top-most visible image
+    if (newImgItems.length === 0 && newVidItems.length === 0) {
+      if (currentImages.length > 0) {
+        console.log("[Flow Batch] Diff returned 0 items; grabbing top-most image (currentImages[0])");
+        emit({ kind: "info", message: "Diff was 0 — grabbing newest visible image on canvas" });
+        newImgItems = [currentImages[0]];
+      } else if (currentVideos.length > 0) {
+        console.log("[Flow Batch] Diff returned 0 items; grabbing top-most video (currentVideos[0])");
+        emit({ kind: "info", message: "Diff was 0 — grabbing newest visible video on canvas" });
+        newVidItems = [currentVideos[0]];
+      }
+    }
+
+    const total = newImgItems.length + newVidItems.length;
+    if (total === 0) {
+      console.warn(`[Flow Batch] No media found on page at all for #${job.n}`);
+      emit({ kind: "warn", message: `no media found on page for #${job.n} — nothing saved` });
+      return;
+    }
+
+    // Log the exact URL or blob scheme detected
+    for (const item of newImgItems) {
+      const scheme = item.src ? (item.src.startsWith("data:") ? "data" : item.src.startsWith("blob:") ? "blob" : (item.src.split(":")[0] || "http")) : "none";
+      console.log(`[Flow Batch] Detected image (${scheme}:):`, item.src ? item.src.slice(0, 120) : "empty");
+      emit({ kind: "info", message: `Detected scheme: ${scheme}: (${(item.src || "").slice(0, 45)}...)` });
+    }
+    for (const vSrc of newVidItems) {
+      const scheme = vSrc ? (vSrc.startsWith("blob:") ? "blob" : (vSrc.split(":")[0] || "http")) : "none";
+      console.log(`[Flow Batch] Detected video (${scheme}:):`, vSrc ? vSrc.slice(0, 120) : "empty");
+      emit({ kind: "info", message: `Detected video scheme: ${scheme}:` });
+    }
+
+    const timestamp = (RUN && RUN.timestamp) || stampNow();
+    const folder = (cfg && cfg.folder) || "Flow-Automation";
+
     let done = 0, seq = 0;
-    // Name each file after Flow's own caption for that image; fall back to the
-    // prompt label. Prefix with the queue number so files sort in run order.
     const one = async (tileIndex, url, name, ext, isVideo) => {
       seq++;
-      const nm = sanitize(name) || fallbackLbl;
-      const suffix = total > 1 ? `__v${seq}` : "";
-      const base = `${RUN.runDir}/${coll}/${nn}_${nm}${suffix}`;
-      const saved = await saveMedia(tabId, tileIndex, url, base, ext, cfg.upscale && !isVideo, isVideo);
-      if (saved) done++; else emit({ kind: "warn", message: "download failed: " + base.split("/").pop() });
-      await sleep(120);
+      const fileName = total > 1 ? `${tag}__v${seq}${ext}` : `${tag}${ext}`;
+      const filename = `${folder}/${timestamp}/${fileName}`;
+
+      emit({ kind: "info", message: `Downloading: ${fileName}...` });
+      console.log(`[Flow Batch] Saving ${filename} from:`, url ? url.slice(0, 100) : "empty");
+
+      const saved = await saveMedia(tabId, tileIndex, url, filename, cfg.upscale && !isVideo, isVideo);
+      if (saved) {
+        done++;
+      } else {
+        console.warn("[Flow Batch] Download failed for:", filename);
+        emit({ kind: "warn", message: "download failed: " + fileName });
+      }
+      await sleep(100);
     };
-    for (let k = 0; k < newImg; k++) await one(k, images[k].src, images[k].name, ".jpg", false); // k: 0 = newest
-    for (let k = 0; k < newVid; k++) await one(k, videos[k], "", ".mp4", true);
-    emit({ kind: "info", message: `✓ saved ${done}/${total} → Downloads/${RUN.runDir}/${coll}/` });
+
+    for (let k = 0; k < newImgItems.length; k++) {
+      await one(k, newImgItems[k].src, newImgItems[k].name, ".png", false);
+    }
+    for (let k = 0; k < newVidItems.length; k++) {
+      await one(k, newVidItems[k], "", ".mp4", true);
+    }
+
+    emit({ kind: "info", message: `✓ saved ${done}/${total} → Downloads/${folder}/${timestamp}/` });
   }
 
   for (; RUN.i < RUN.queue.length; RUN.i++) {
     if (RUN.stopped) break;
-    while (RUN.paused && !RUN.stopped) await sleep(400);
+    while (RUN.paused && !RUN.stopped && !RUN.skipWait) await sleep(250);
     if (RUN.stopped) break;
 
+    RUN.skipWait = false;
     const job = RUN.queue[RUN.i];
+
+    // Ensure customTag exists
+    if (!job.customTag) {
+      const tagMatch = (job.prompt || "").match(/^(?:#?\s*)(\d+[-_]\d+)/) ||
+                       ((job.label || "").match(/^(?:#?\s*)(\d+[-_]\d+)/));
+      if (tagMatch) {
+        job.customTag = tagMatch[1];
+        job.prompt = job.prompt.replace(/^(?:#?\s*)\d+[-_]\d+[\s\:\-\.]*/i, "").trim();
+      } else {
+        job.customTag = String(job.n || (RUN.i + 1)).padStart(2, "0");
+      }
+    }
+
     emit({ kind: "start", index: RUN.i, total: RUN.queue.length, job });
 
     // 0) dismiss any stray menu/popover left open from the previous prompt
     await send(tabId, { cmd: "dismiss" });
+    try { await chrome.tabs.update(tabId, { active: true }); } catch (_) {}
+
+    // Snapshot media BEFORE submitting this prompt
+    const beforeMediaRes = await send(tabId, { cmd: "mediaItems" });
+    const beforeMedia = {
+      images: (beforeMediaRes.ok && beforeMediaRes.images) || [],
+      videos: (beforeMediaRes.ok && beforeMediaRes.videos) || [],
+    };
+    const beforeMediaCount = beforeMedia.images.length + beforeMedia.videos.length;
+    const beforeTopUrl = (beforeMedia.images[0] && beforeMedia.images[0].src) || beforeMedia.videos[0] || "";
 
     // 1) focus + clear the prompt box (content script), get its center point
     const f = await send(tabId, { cmd: "focusPrompt" });
     if (!f.ok) {
       emit({ kind: "error", index: RUN.i, job, message: "focus: " + f.error });
-      await sleep(cfg.gapSec * 1000); continue;
+      await sleep(cfg.gapSec * 1000);
+      continue;
     }
     // 2) type the prompt with TRUSTED keystrokes (debugger), then verify it landed.
-    //    Retry with a fresh focus a few times — the fresh "Untitled session"
-    //    composer sometimes drops the first insert — and SKIP (not kill the run)
-    //    if it never takes.
     const promptKey = job.prompt.slice(0, 24).toLowerCase();
     const didType = async () => {
       const r = await send(tabId, { cmd: "readPrompt" });
       return r.ok && (r.text || "").includes(promptKey);
     };
     let typed = false;
-    for (let a = 0; a < 3 && !typed && !RUN.stopped; a++) {
-      if (a > 0) { // re-focus + clear before re-typing
+    for (let a = 0; a < 3 && !typed && !RUN.stopped && !RUN.skipWait; a++) {
+      if (a > 0) {
         await send(tabId, { cmd: "dismiss" });
         const rf = await send(tabId, { cmd: "focusPrompt" });
         if (rf.ok) { f.x = rf.x; f.y = rf.y; }
@@ -299,57 +472,61 @@ async function runLoop() {
       }
       try { await cdpType(tabId, f.x, f.y, job.prompt); }
       catch (e) { emit({ kind: "warn", message: "type (debugger): " + e.message }); }
-      await sleep(400);
+      await sleep(350);
       typed = await didType();
+      if (!typed) {
+        // Fallback: direct synthetic injection via content script
+        await send(tabId, { cmd: "typePrompt", text: job.prompt });
+        await sleep(250);
+        typed = await didType();
+      }
+    }
+    if (RUN.skipWait) {
+      continue;
     }
     if (!typed) {
       emit({ kind: "error", index: RUN.i, job, message: "prompt didn't type into Flow — skipping (make sure the Flow tab is the active/focused window)" });
       await send(tabId, { cmd: "dismiss" });
       await sleep(cfg.gapSec * 1000);
-      continue; // one stuck prompt must never kill the whole run
+      continue;
     }
     // submit as a TRUSTED click; confirm success by the prompt box CLEARING
-    // (Flow empties the box once a generation is accepted — the reliable signal).
     const boxCleared = async () => {
       const r = await send(tabId, { cmd: "readPrompt" });
       return r.ok && !(r.text || "").includes(promptKey);
     };
-    // Right after a prior generation kicks off, the prompt bar can shift or the submit
-    // arrow disables for a moment — so RETRY: wait for the button to be enabled, re-fetch
-    // its rect (layout moves), click it, and interleave a trusted Enter (after re-focusing
-    // the box, no clear) as a fallback. This is what makes long 50+ runs reliable.
     let submitted = false;
-    for (let attempt = 0; attempt < 6 && !submitted && !RUN.stopped; attempt++) {
-      for (let w = 0; w < 12; w++) { const se = await send(tabId, { cmd: "submitEnabled" }); if (se.ok && se.enabled) break; await sleep(250); }
+    for (let attempt = 0; attempt < 6 && !submitted && !RUN.stopped && !RUN.skipWait; attempt++) {
+      for (let w = 0; w < 12; w++) { const se = await send(tabId, { cmd: "submitEnabled" }); if (se.ok && se.enabled) break; await sleep(200); }
       const sr = await send(tabId, { cmd: "submitRect" });
       if (sr.ok) { try { await cdpClick(tabId, sr.x, sr.y); } catch (e) {} }
-      for (let t = 0; t < 8 && !submitted; t++) { await sleep(350); if (await boxCleared()) submitted = true; }
-      if (submitted) break;
-      const pr = await send(tabId, { cmd: "promptRect" }); // re-focus without clearing, then trusted Enter
-      if (pr.ok) { try { await cdpClick(tabId, pr.x, pr.y); await sleep(120); await cdpEnter(tabId); } catch (e) {} }
-      for (let t = 0; t < 6 && !submitted; t++) { await sleep(350); if (await boxCleared()) submitted = true; }
+      for (let t = 0; t < 8 && !submitted && !RUN.skipWait; t++) { await sleep(300); if (await boxCleared()) submitted = true; }
+      if (submitted || RUN.skipWait) break;
+      const pr = await send(tabId, { cmd: "promptRect" });
+      if (pr.ok) { try { await cdpClick(tabId, pr.x, pr.y); await sleep(100); await cdpEnter(tabId); } catch (e) {} }
+      for (let t = 0; t < 6 && !submitted && !RUN.skipWait; t++) { await sleep(300); if (await boxCleared()) submitted = true; }
+    }
+    if (RUN.skipWait) {
+      continue;
     }
     if (!submitted) {
-      // SKIP this one and keep going — a single stuck prompt must never kill a big run.
       emit({ kind: "error", index: RUN.i, job, message: "couldn't submit after retries — skipping this prompt" });
       await send(tabId, { cmd: "dismiss" });
       await sleep(cfg.gapSec * 1000);
       continue;
     }
-    RUN.submitted.push(job); // confirmed, in submission order (for download naming)
+    RUN.submitted.push(job);
 
-    // FAST mode: Flow's Agent handles ONE request at a time (it "thinks", then
-    // generates), so we can't fire prompts in parallel — submitting while it's
-    // busy gets dropped. Wait for THIS prompt to finish before the next one.
-    // Waits as long as the image needs (up to pollTimeoutSec), not a fixed delay.
-    // Wait for THIS prompt to finish (the Agent is one-at-a-time), then save its
-    // result immediately into this run's folder before moving to the next prompt.
-    const beforeImg = f.before || 0, beforeVid = f.beforeVid || 0;
-    await waitForCompletion(tabId, cfg, beforeImg + beforeVid);
-    if (!RUN.stopped) await downloadJob(job, beforeImg, beforeVid);
+    // Active polling for completion without long static delays
+    await waitForCompletion(tabId, cfg, beforeMediaCount, beforeTopUrl);
+    if (!RUN.stopped && !RUN.skipWait) {
+      await downloadJob(job, beforeMedia);
+    }
 
     emit({ kind: "done", index: RUN.i, job });
-    await sleep(cfg.gapSec * 1000);
+    if (!RUN.skipWait) {
+      await sleep(cfg.gapSec * 1000);
+    }
   }
 
   await dbgDetach(); // remove the "being debugged" banner
@@ -358,9 +535,92 @@ async function runLoop() {
   RUN.running = false;
 }
 
+// Manual download triggered from the side panel UI
+async function handleManualDownload(mode /* "latest" | "all" */, requestedTag) {
+  const tab = await findFlowTab();
+  if (!tab) {
+    emit({ kind: "warn", message: "No Google Flow tab found." });
+    return { ok: false, error: "Open a Google Flow project tab first." };
+  }
+
+  const mres = await send(tab.id, { cmd: "mediaItems" });
+  const images = (mres.ok && mres.images) || [];
+  const videos = (mres.ok && mres.videos) || [];
+
+  console.log(`[Flow Batch] handleManualDownload (${mode}): found ${images.length} images, ${videos.length} videos`);
+  emit({ kind: "info", message: `Found ${images.length} images, ${videos.length} videos on canvas` });
+
+  if (images.length === 0 && videos.length === 0) {
+    emit({ kind: "warn", message: "No visible images or videos detected on Flow canvas." });
+    return { ok: false, error: "No media detected on Flow canvas." };
+  }
+
+  const timestamp = (RUN && RUN.timestamp) || stampNow();
+  const folder = (RUN && RUN.folder) || "Flow-Automation";
+  const currentJob = (RUN && RUN.queue && RUN.queue[RUN.i]) ? RUN.queue[RUN.i] : null;
+
+  if (mode === "latest") {
+    const tag = requestedTag || (currentJob && currentJob.customTag) || `image_${Date.now()}`;
+    if (images.length > 0) {
+      const item = images[0];
+      const fileName = `${tag}.png`;
+      const filename = `${folder}/${timestamp}/${fileName}`;
+      console.log(`[Flow Batch] Manual download latest: ${filename}, src:`, item.src ? item.src.slice(0, 100) : "empty");
+      emit({ kind: "info", message: `Downloading latest image: ${fileName}...` });
+      const saved = await saveMedia(tab.id, 0, item.src, filename, false, false);
+      if (saved) {
+        emit({ kind: "info", message: `✓ Downloaded latest: ${fileName}` });
+        return { ok: true, filename };
+      } else {
+        emit({ kind: "warn", message: "Failed to download latest image" });
+        return { ok: false, error: "Failed to download image file" };
+      }
+    } else {
+      const vidSrc = videos[0];
+      const fileName = `${tag}.mp4`;
+      const filename = `${folder}/${timestamp}/${fileName}`;
+      emit({ kind: "info", message: `Downloading latest video: ${fileName}...` });
+      const saved = await saveMedia(tab.id, 0, vidSrc, filename, false, true);
+      if (saved) {
+        emit({ kind: "info", message: `✓ Downloaded latest video: ${fileName}` });
+        return { ok: true, filename };
+      } else {
+        return { ok: false, error: "Failed to download video file" };
+      }
+    }
+  }
+
+  // mode === "all"
+  emit({ kind: "info", message: `Starting download of all ${images.length + videos.length} visible items...` });
+  let count = 0;
+  for (let i = 0; i < images.length; i++) {
+    const item = images[i];
+    const qJob = (RUN && RUN.queue && RUN.queue[i]) ? RUN.queue[i] : null;
+    const tag = (qJob && qJob.customTag) ? qJob.customTag : String(i + 1).padStart(2, "0");
+    const fileName = `${tag}.png`;
+    const filename = `${folder}/${timestamp}/${fileName}`;
+    emit({ kind: "info", message: `[${i + 1}/${images.length}] Downloading: ${fileName}...` });
+    const saved = await saveMedia(tab.id, i, item.src, filename, false, false);
+    if (saved) count++;
+    await sleep(100);
+  }
+  for (let i = 0; i < videos.length; i++) {
+    const vidSrc = videos[i];
+    const nn = String(images.length + i + 1).padStart(2, "0");
+    const fileName = `video_${nn}.mp4`;
+    const filename = `${folder}/${timestamp}/${fileName}`;
+    const saved = await saveMedia(tab.id, i, vidSrc, filename, false, true);
+    if (saved) count++;
+    await sleep(100);
+  }
+  emit({ kind: "info", message: `✓ Saved ${count}/${images.length + videos.length} items → Downloads/${folder}/${timestamp}/` });
+  return { ok: true, count };
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
-    switch (msg.type) {
+    const action = msg.type || msg.cmd;
+    switch (action) {
       case "start": {
         const tab = await findFlowTab();
         if (!tab) return sendResponse({ ok: false, error: "Open a Google Flow project tab first." });
@@ -380,22 +640,42 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
         if (!ping.project) return sendResponse({ ok: false, error: "Open a Flow PROJECT (click New project), then start." });
         const cfg = { ...DEFAULTS, ...(msg.cfg || {}) };
+        const ts = stampNow();
         RUN = {
           queue: msg.queue, i: msg.startIndex || 0, tabId: tab.id,
           paused: false, stopped: false, running: true, submitted: [],
-          cfg, runDir: cfg.folder + "/" + stampNow(), // fresh folder per Start
+          cfg, timestamp: ts, folder: cfg.folder || "Flow-Automation",
+          runDir: (cfg.folder || "Flow-Automation") + "/" + ts,
         };
         runLoop();
         return sendResponse({ ok: true, count: msg.queue.length });
       }
       case "pause": if (RUN) RUN.paused = true; return sendResponse({ ok: true });
       case "resume": if (RUN) RUN.paused = false; return sendResponse({ ok: true });
-      case "manualNext": if (RUN) RUN.awaitingManual = false; return sendResponse({ ok: true });
+      case "skipNext":
+      case "manualNext": {
+        if (RUN) {
+          RUN.awaitingManual = false;
+          RUN.skipWait = true;
+          RUN.paused = false;
+          console.log("[Flow Batch] Next / Skip requested for prompt index", RUN.i);
+          emit({ kind: "info", message: "⏭ Advancing to next prompt..." });
+        }
+        return sendResponse({ ok: true });
+      }
       case "stop": if (RUN) { RUN.stopped = true; RUN.awaitingManual = false; } dbgDetach(); return sendResponse({ ok: true });
       case "state":
         return sendResponse({ ok: true, running: !!(RUN && RUN.running), i: RUN ? RUN.i : 0, paused: RUN ? RUN.paused : false });
+      case "downloadLatestManual": {
+        const res = await handleManualDownload("latest", msg.customTag);
+        return sendResponse(res);
+      }
+      case "downloadAllManual": {
+        const res = await handleManualDownload("all");
+        return sendResponse(res);
+      }
       default:
-        return sendResponse({ ok: false, error: "unknown type" });
+        return sendResponse({ ok: false, error: "unknown type: " + action });
     }
   })();
   return true;

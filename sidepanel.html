@@ -77,9 +77,18 @@ A macro close-up of the velvet pile, soft raking light...
   <section class="actions">
     <button id="start" class="primary">Start</button>
     <button id="pause" disabled>Pause</button>
-    <button id="next" disabled>Next ▶</button>
+    <button id="btnNext" disabled>Next ▶</button>
     <button id="stop" disabled>Stop</button>
   </section>
+
+  <div class="manual-actions" style="margin-top: 12px; display: flex; gap: 8px;">
+    <button id="btnDownloadLatest" type="button" style="flex: 1; padding: 8px; font-weight: bold; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer;">
+      ⬇ Download Latest Generated
+    </button>
+    <button id="btnDownloadAll" type="button" style="flex: 1; padding: 8px; background: #374151; color: #fff; border: none; border-radius: 4px; cursor: pointer;">
+      ⬇ Download All Visible
+    </button>
+  </div>
 
   <section class="card">
     <div class="row"><strong>Queue:</strong> <span id="queueCount">0</span> prompts</div>
