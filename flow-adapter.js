@@ -99,53 +99,95 @@
     return true;
   }
 
-  // ---- prompt box ----------------------------------------------------------
-  // The Agent composer's prompt box is a contenteditable div[role=textbox]; its
-  // placeholder ("What do you want to create?") is rendered as textContent when
-  // empty (NOT a placeholder attr / aria-label). (Recalibrated live, July 2026.)
+  // ---- prompt box & injection ----------------------------------------------
+  // Deep search across standard DOM tree and open Shadow Roots
+  function queryAllDeep(selector, root = document) {
+    let results = [...root.querySelectorAll(selector)];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      if (node.shadowRoot) {
+        results = results.concat(queryAllDeep(selector, node.shadowRoot));
+      }
+    }
+    return results;
+  }
+
+  // The prompt box in Google Flow can be a <textarea>, a contenteditable element
+  // (div/p with contenteditable="true" or contenteditable="plaintext-only"), or
+  // an element with role="textbox".
   function findPromptBox() {
-    const ph = "what do you want to create";
+    const phKeywords = ["what do you want to create", "describe", "prompt", "imagine", "type", "create"];
 
-    // 1) Check visible <textarea>, <input>, or [contenteditable="true"] matching placeholder or aria-label
-    const editables = [
-      ...document.querySelectorAll('textarea, input, [contenteditable="true"], [role="textbox"]')
-    ].filter(visible);
+    // 1) Collect all candidate interactive text elements deep in the DOM & Shadow Roots
+    const rawCandidates = queryAllDeep(
+      'textarea, input:not([type="button"]):not([type="submit"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"]), [contenteditable]:not([contenteditable="false"]), [role="textbox"]'
+    ).filter(visible);
 
-    let el = editables.find((e) => {
-      const aria = norm(e.getAttribute("aria-label") || "");
-      const placeholder = norm(e.getAttribute("placeholder") || e.placeholder || e.dataset.placeholder || "");
-      const text = norm(e.textContent || "");
-      return aria.includes(ph) || placeholder.includes(ph) || text.includes(ph);
+    if (!rawCandidates.length) return null;
+
+    // Filter out search bars or top-bar elements (Google Flow search is at y < 130)
+    const validCandidates = rawCandidates.filter((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.top < 120 && (el.getAttribute("type") === "search" || /search|filter/i.test(el.getAttribute("aria-label") || "") || /search/i.test(el.getAttribute("placeholder") || ""))) {
+        return false;
+      }
+      return true;
     });
-    if (el) return el;
 
-    // 2) If not found directly, locate any visible label containing "what do you want to create",
-    // traverse to its closest container (div, form, or div[role="region"]), and query for the inner textarea or [contenteditable="true"]
-    const labels = [...document.querySelectorAll("label, span, p, div")].filter(
-      (e) => visible(e) && norm(e.textContent).includes(ph)
-    );
+    if (!validCandidates.length) return null;
 
-    for (const lbl of labels) {
-      let cur = lbl.parentElement;
-      while (cur && cur !== document.body) {
-        if (cur.matches('form, [role="region"], div')) {
-          const inner = [
-            ...cur.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"], input')
-          ].find(visible);
-          if (inner) return inner;
-        }
-        cur = cur.parentElement;
+    // Score candidates based on relevance, attributes, and proximity to the prompt bar
+    const scored = validCandidates.map((el) => {
+      let score = 0;
+      const r = el.getBoundingClientRect();
+      const aria = norm(el.getAttribute("aria-label") || "");
+      const placeholder = norm(el.getAttribute("placeholder") || el.placeholder || (el.dataset && el.dataset.placeholder) || "");
+      const text = norm(el.textContent || "");
+      const role = norm(el.getAttribute("role") || "");
+
+      // Proximity to bottom: Google Flow's prompt bar is docked in the lower part of the window
+      if (r.bottom > window.innerHeight * 0.45) score += 30;
+      if (r.top < 120) score -= 100; // Search inputs at top
+
+      // Placeholder or label matching
+      for (const kw of phKeywords) {
+        if (placeholder.includes(kw)) { score += 50; break; }
+        if (aria.includes(kw)) { score += 40; break; }
+        if (text.includes(kw)) { score += 30; break; }
+      }
+
+      // Element type preference
+      if (el.tagName === "TEXTAREA") score += 25;
+      else if (el.isContentEditable || el.getAttribute("contenteditable") !== null) score += 25;
+      else if (role === "textbox") score += 15;
+
+      // Inside container with submit button or model pill
+      const container = el.closest('form, [role="region"], div');
+      if (container) {
+        if (container.querySelector('button, [role="button"]')) score += 15;
+      }
+
+      // If this element contains child editables, penalize it so we choose the leaf editor
+      const childEditable = el.querySelector('textarea, [contenteditable]:not([contenteditable="false"]), input');
+      if (childEditable && childEditable !== el) score -= 40;
+
+      return { el, score, r };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+
+    let chosen = scored[0] ? scored[0].el : null;
+
+    // Ensure if a container was chosen, pick its leaf editable child if present
+    if (chosen && chosen.tagName !== "TEXTAREA" && chosen.tagName !== "INPUT" && !chosen.isContentEditable) {
+      const inner = chosen.querySelector('textarea, [contenteditable]:not([contenteditable="false"]), input');
+      if (inner && visible(inner)) {
+        chosen = inner;
       }
     }
 
-    // 3) Fallback: Select the lowest visible textarea or [contenteditable="true"] on the screen based on bounding rect coordinates
-    const candidates = [
-      ...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')
-    ]
-      .filter(visible)
-      .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
-
-    return candidates[0] || null;
+    return chosen;
   }
 
   // The Agent hides the prompt box while it is busy ("Defining the scope…" /
@@ -158,28 +200,237 @@
     return box;
   }
 
+  // Safe coordinate calculation for focusing/clicking the text editor.
+  // CRITICAL: Click on the LEFT side of the text area to avoid clicking model chips or buttons.
+  function getPromptBoxCoordinates(box) {
+    if (!box) return { x: 0, y: 0 };
+    const r = box.getBoundingClientRect();
+    const clickX = Math.min(r.left + 35, r.left + r.width / 4);
+    const clickY = r.top + r.height / 2;
+    return { x: clickX, y: clickY, rect: r };
+  }
+
+  // Read the current text value from prompt editor, safely filtering out placeholder text
+  function readPromptValue(box) {
+    if (!box) return "";
+    let val = "";
+    if (box.tagName === "TEXTAREA" || box.tagName === "INPUT") {
+      val = box.value || "";
+    } else if (box.isContentEditable || box.getAttribute("contenteditable") !== null) {
+      const ph = "what do you want to create";
+      const raw = box.textContent || box.innerText || "";
+      // If content is purely the placeholder text, treat as empty
+      if (norm(raw) === ph || norm(raw) === ph + "?") {
+        val = "";
+      } else {
+        val = raw;
+      }
+    } else {
+      val = box.value !== undefined ? box.value : (box.innerText || box.textContent || "");
+    }
+    return val;
+  }
+
+  // Robust native value setter for textarea/input with React 16-19 tracker handling
   function setNativeValue(el, value) {
     const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
-    setter.call(el, value);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
+    const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    if (setter) {
+      setter.call(el, value);
+    } else {
+      el.value = value;
+    }
+
+    // React 16-19 value tracker support: React checks _valueTracker to detect changes.
+    // If we don't update/reset it, React ignores the synthetic input event!
+    if (el._valueTracker) {
+      el._valueTracker.setValue(value === "" ? "previous_dummy_val" : "");
+    }
+
+    // 1. Dispatch beforeinput (vital for modern frameworks)
+    try {
+      el.dispatchEvent(new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        inputType: "insertText",
+        data: value,
+      }));
+    } catch (_) {}
+
+    // 2. Dispatch input
+    try {
+      el.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        inputType: "insertText",
+        data: value,
+      }));
+    } catch (_) {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    // 3. Dispatch change
     el.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
-  async function typePrompt(text) {
+  // Clear contenteditable element
+  function clearContentEditable(el) {
+    el.focus();
+    try {
+      const sel = window.getSelection();
+      if (sel) {
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand("delete", false, null);
+      }
+    } catch (_) {}
+    if (el.textContent && el.textContent.trim().length > 0) {
+      el.textContent = "";
+    }
+    try {
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true }));
+    } catch (_) {}
+  }
+
+  // Robust contenteditable text insertion with caret range and input events
+  function setContentEditableText(el, text) {
+    el.focus();
+
+    // 1. Place caret inside element
+    const sel = window.getSelection();
+    if (sel) {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+
+    // 2. Dispatch beforeinput
+    try {
+      el.dispatchEvent(new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        inputType: "insertText",
+        data: text,
+      }));
+    } catch (_) {}
+
+    // 3. Insert via execCommand (most reliable for contenteditable / ProseMirror / Lexical)
+    let ok = false;
+    try {
+      ok = document.execCommand("insertText", false, text);
+    } catch (_) {}
+
+    // 4. Fallback if execCommand failed or was blocked
+    if (!ok || !el.textContent.includes(text.slice(0, 15))) {
+      el.textContent = text;
+    }
+
+    // 5. Dispatch input
+    try {
+      el.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        inputType: "insertText",
+        data: text,
+      }));
+    } catch (_) {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+  }
+
+  // Direct React props/handlers fallback
+  function triggerReactHandlers(el, value) {
+    try {
+      const propKey = Object.keys(el).find((k) => k.startsWith("__reactProps") || k.startsWith("__reactEventHandlers"));
+      if (propKey && el[propKey]) {
+        const props = el[propKey];
+        if (typeof props.onChange === "function") {
+          props.onChange({ target: el, currentTarget: el, type: "change" });
+        }
+        if (typeof props.onInput === "function") {
+          props.onInput({ target: el, currentTarget: el, type: "input" });
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Complete robust prompt injection
+  async function injectPrompt(text) {
+    console.log("[Flow Batch] Queue prompt:", text ? text.slice(0, 60) + "..." : "(empty)");
     const box = findPromptBox();
-    if (!box) throw new Error("prompt box not found");
+    if (!box) {
+      console.error("[Flow Batch] Prompt box not found!");
+      return { ok: false, error: "Prompt box not found", recognized: false };
+    }
+
+    console.log("[Flow Batch] Found Flow input:", `<${box.tagName.toLowerCase()}>`, {
+      id: box.id || null,
+      role: box.getAttribute("role") || null,
+      placeholder: box.getAttribute("placeholder") || box.placeholder || null,
+      isContentEditable: box.isContentEditable,
+      rect: box.getBoundingClientRect(),
+    });
+
+    console.log("[Flow Batch] Injecting prompt...");
+
+    // 1. Focus
     box.focus();
+    await sleep(60);
+
+    // 2. Clear
+    if (box.tagName === "TEXTAREA" || box.tagName === "INPUT") {
+      setNativeValue(box, "");
+    } else {
+      clearContentEditable(box);
+    }
+    await sleep(40);
+
+    // 3. Insert text
     if (box.tagName === "TEXTAREA" || box.tagName === "INPUT") {
       setNativeValue(box, text);
     } else {
-      // contenteditable
-      box.textContent = "";
-      document.execCommand("insertText", false, text);
-      box.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      setContentEditableText(box, text);
     }
-    await sleep(120);
-    return true;
+
+    // 4. Sync React handlers
+    triggerReactHandlers(box, text);
+
+    await sleep(150);
+
+    // 5. Verification
+    const currentVal = readPromptValue(box);
+    console.log("[Flow Batch] Input value after injection:", currentVal ? `"${currentVal.slice(0, 60)}..."` : "(empty)");
+
+    const promptSnippet = norm(text.slice(0, 20));
+    const recognized = promptSnippet ? norm(currentVal).includes(promptSnippet) : currentVal.trim().length > 0;
+    console.log("[Flow Batch] Flow recognized prompt:", recognized ? "YES" : "NO");
+
+    const submitBtn = findSubmitButton();
+    const btnDisabled = isSubmitButtonDisabled(submitBtn);
+    console.log("[Flow Batch] Generate button state:", btnDisabled ? "disabled" : "enabled");
+
+    return {
+      ok: recognized,
+      recognized,
+      currentValue: currentVal,
+      generateEnabled: !btnDisabled,
+    };
+  }
+
+  async function typePrompt(text) {
+    const res = await injectPrompt(text);
+    if (!res.ok) {
+      console.warn("[Flow Batch] injectPrompt verification returned not recognized, will retry");
+    }
+    return res.ok;
   }
 
   // ---- generation settings (Agent settings panel) --------------------------
@@ -349,6 +600,25 @@
   }
 
   // ---- submit --------------------------------------------------------------
+  function isSubmitButtonDisabled(b) {
+    if (!b) return true;
+    if (b.disabled) return true;
+    if (b.getAttribute("aria-disabled") === "true" || /true/i.test(b.getAttribute("aria-disabled") || "")) return true;
+    if (b.classList.contains("disabled") || b.getAttribute("data-disabled") === "true") return true;
+    try {
+      const cs = getComputedStyle(b);
+      if (cs.pointerEvents === "none") return true;
+      if (parseFloat(cs.opacity) < 0.4) return true;
+    } catch (_) {}
+    try {
+      const rKey = Object.keys(b).find((k) => k.startsWith("__reactProps"));
+      if (rKey && b[rKey]) {
+        if (b[rKey].disabled === true || b[rKey]["aria-disabled"] === true) return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
   function isStopButton(b) {
     if (!b) return false;
     const t = norm(b.textContent);
@@ -707,6 +977,178 @@
   }
 
   // ---- message router ------------------------------------------------------
+
+  // Detect error banners/messages on Google Flow (e.g. policy violations, unusual activity, rate limits, failures)
+  function detectFlowError() {
+    // 1. Look for known error toast/snackbar/banner/dialog/alert elements
+    // CRITICAL: MUST NOT inspect existing tiles/cards on the canvas, because an old
+    // "OPERATION FAILED" card from a previous failure must never block retries or new prompts!
+    const isInsideCanvasCard = (el) => {
+      try {
+        return !!el.closest('[class*="tile" i], [class*="card" i], [class*="canvas" i], [class*="workspace" i], [class*="grid" i], flow-card, flow-tile');
+      } catch (_) {
+        return false;
+      }
+    };
+
+    const errorContainers = [
+      ...document.querySelectorAll(
+        '[role="alert"], [role="dialog"], [aria-live="assertive"], [class*="snackbar" i], [class*="toast" i], [class*="banner" i], mat-snack-bar-container, mwc-snackbar, .error-message'
+      )
+    ].filter((el) => visible(el) && !isInsideCanvasCard(el));
+
+    // 2. Also look at small floating overlay notifications
+    const allCandidates = new Set(errorContainers);
+    document.querySelectorAll('[role="alert"] p, [role="alert"] span, [role="dialog"] p, [role="dialog"] span, [class*="snackbar" i] span, [class*="toast" i] span').forEach((el) => {
+      if (visible(el) && !isInsideCanvasCard(el)) allCandidates.add(el);
+    });
+
+    for (const el of allCandidates) {
+      const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+      if (!text) continue;
+
+      // Empty prompt validation error from Flow UI
+      if (/prompt must be provided|please enter a prompt|prompt is required|empty prompt/i.test(text)) {
+        return {
+          hasError: true,
+          type: "empty_prompt",
+          message: text.length > 140 ? text.slice(0, 140) + "..." : text
+        };
+      }
+
+      // Policy violation
+      if (/policy|safety guidelines|content violation|restricted content|violat|prompt blocked|against our policy/i.test(text)) {
+        return {
+          hasError: true,
+          type: "policy",
+          message: text.length > 140 ? text.slice(0, 140) + "..." : text
+        };
+      }
+
+      // Unusual activity / rate limit / quota
+      if (/unusual activity|unusual traffic|quota|rate limit|too many requests|suspicious activity|try again later/i.test(text)) {
+        return {
+          hasError: true,
+          type: "unusual_activity",
+          message: text.length > 140 ? text.slice(0, 140) + "..." : text
+        };
+      }
+
+      // General generation failure in floating toast/dialog
+      if (/failed to generate|generation failed|unable to generate|could not generate|something went wrong|error generating|cannot generate/i.test(text)) {
+        return {
+          hasError: true,
+          type: "failed",
+          message: text.length > 140 ? text.slice(0, 140) + "..." : text
+        };
+      }
+    }
+
+    return { hasError: false };
+  }
+
+    // Full DOM Diagnostic as required for inspecting Flow page
+  function diagnoseDOM() {
+    console.group("[Flow Batch Diagnostic] Google Flow DOM Inspection");
+    const editables = queryAllDeep('textarea, input:not([type="button"]):not([type="submit"]):not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"]), [contenteditable]:not([contenteditable="false"]), [role="textbox"]');
+    
+    console.log(`[Flow Batch Diagnostic] Found ${editables.length} editable candidate elements across document and shadow roots:`);
+    const candidateInfos = editables.map((el, i) => {
+      const r = el.getBoundingClientRect();
+      return {
+        index: i,
+        tagName: el.tagName,
+        isContentEditable: el.isContentEditable || el.getAttribute("contenteditable") !== null,
+        role: el.getAttribute("role") || "",
+        placeholder: el.getAttribute("placeholder") || el.placeholder || (el.dataset && el.dataset.placeholder) || "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        rect: `${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)}`,
+        valueSnippet: (el.value || el.textContent || "").slice(0, 30),
+      };
+    });
+    console.table(candidateInfos);
+
+    const box = findPromptBox();
+    let boxDiag = null;
+    if (box) {
+      const r = box.getBoundingClientRect();
+      const parents = [];
+      let p = box.parentElement;
+      while (p && parents.length < 8) {
+        parents.push(`${p.tagName.toLowerCase()}${p.id ? '#' + p.id : ''}${p.className ? '.' + String(p.className).trim().replace(/\s+/g, '.') : ''}`);
+        p = p.parentElement;
+      }
+
+      // Check if inside shadow root or iframe
+      let isShadow = false;
+      let curr = box.parentNode;
+      while (curr) {
+        if (curr instanceof ShadowRoot) { isShadow = true; break; }
+        curr = curr.parentNode;
+      }
+      const inIframe = window.self !== window.top;
+
+      boxDiag = {
+        tagName: box.tagName,
+        id: box.id || null,
+        className: box.className || null,
+        role: box.getAttribute("role") || null,
+        placeholder: box.getAttribute("placeholder") || box.placeholder || (box.dataset && box.dataset.placeholder) || null,
+        ariaLabel: box.getAttribute("aria-label") || null,
+        contenteditable: box.getAttribute("contenteditable"),
+        isContentEditable: box.isContentEditable,
+        isTextarea: box.tagName === "TEXTAREA",
+        isInput: box.tagName === "INPUT",
+        currentValue: box.value !== undefined ? box.value : null,
+        currentTextContent: box.textContent || null,
+        currentInnerText: box.innerText || null,
+        rect: { left: r.left, top: r.top, width: r.width, height: r.height, bottom: r.bottom },
+        parentChain: parents.join(" > "),
+        isInsideShadowRoot: isShadow,
+        isInsideIframe: inIframe,
+      };
+
+      console.log("[Flow Batch Diagnostic] Active/Chosen Prompt Editor:", boxDiag);
+    } else {
+      console.warn("[Flow Batch Diagnostic] No Prompt Editor found!");
+    }
+
+    const btn = findSubmitButton();
+    let btnDiag = null;
+    if (btn) {
+      const br = btn.getBoundingClientRect();
+      btnDiag = {
+        tagName: btn.tagName,
+        className: btn.className || null,
+        ariaLabel: btn.getAttribute("aria-label") || null,
+        title: btn.getAttribute("title") || null,
+        disabled: btn.disabled || false,
+        ariaDisabled: btn.getAttribute("aria-disabled") || null,
+        hasSvg: !!btn.querySelector("svg"),
+        rect: { left: br.left, top: br.top, width: br.width, height: br.height },
+        effectivelyDisabled: isSubmitButtonDisabled(btn),
+      };
+      console.log("[Flow Batch Diagnostic] Active/Chosen Generate Button:", btnDiag);
+    } else {
+      console.warn("[Flow Batch Diagnostic] No Generate Button found!");
+    }
+
+    const flowErrors = detectFlowError();
+    console.log("[Flow Batch Diagnostic] Flow Errors Detected:", flowErrors);
+    console.groupEnd();
+
+    return {
+      ok: true,
+      timestamp: new Date().toISOString(),
+      url: location.href,
+      promptBox: boxDiag,
+      submitButton: btnDiag,
+      candidatesCount: editables.length,
+      candidates: candidateInfos,
+      flowErrors,
+    };
+  }
+
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     (async () => {
       try {
@@ -733,31 +1175,52 @@
             return sendResponse({ ok: true });
           }
           case "focusPrompt": {
-            // focus + clear the contenteditable / textarea, place caret, return its center
-            // point so the background can type via the debugger (trusted input).
-            // Wait for the box first: the Agent removes it while busy, so this is
-            // what serialises the batch (next prompt waits for the agent to idle).
             const box = await waitForPromptBox();
             if (!box) return sendResponse({ ok: false, error: "prompt box not found (agent still busy?)" });
             box.focus();
             try {
-              if (box.tagName === "TEXTAREA" || box.tagName === "INPUT" || box.value !== undefined) {
-                box.value = "";
-                box.dispatchEvent(new Event("input", { bubbles: true }));
-                box.dispatchEvent(new Event("change", { bubbles: true }));
+              if (box.tagName === "TEXTAREA" || box.tagName === "INPUT") {
+                setNativeValue(box, "");
                 if (typeof box.setSelectionRange === "function") {
                   box.setSelectionRange(0, 0);
                 }
               } else {
-                const sel = getSelection(), r = document.createRange();
-                r.selectNodeContents(box); sel.removeAllRanges(); sel.addRange(r);
-                document.execCommand("delete");
-                const r2 = document.createRange(); r2.selectNodeContents(box); r2.collapse(false);
-                sel.removeAllRanges(); sel.addRange(r2);
+                clearContentEditable(box);
               }
             } catch (e) {}
-            const rect = box.getBoundingClientRect();
-            return sendResponse({ ok: true, before: countMedia(), beforeVid: genVideos().length, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+            const coords = getPromptBoxCoordinates(box);
+            return sendResponse({
+              ok: true,
+              before: countMedia(),
+              beforeVid: genVideos().length,
+              x: coords.x,
+              y: coords.y,
+              rect: coords.rect,
+              tag: box.tagName,
+              isContentEditable: box.isContentEditable
+            });
+          }
+          case "verifyPrompt": {
+            const box = findPromptBox();
+            if (!box) return sendResponse({ ok: false, verified: false, error: "prompt box not found" });
+            const val = readPromptValue(box);
+            const expected = norm(msg.expected || "");
+            const recognized = expected ? norm(val).includes(expected) : val.trim().length > 0;
+            const btn = findSubmitButton();
+            const submitDisabled = isSubmitButtonDisabled(btn);
+            console.log(`[Flow Batch] verifyPrompt: expected="${expected.slice(0, 20)}...", recognized=${recognized}, submitDisabled=${submitDisabled}`);
+            return sendResponse({
+              ok: true,
+              verified: recognized,
+              text: norm(val),
+              rawText: val,
+              submitDisabled,
+              submitPresent: !!btn,
+            });
+          }
+          case "diagnoseDOM": {
+            const diag = diagnoseDOM();
+            return sendResponse(diag);
           }
           case "clickSubmit": {
             await submit();
@@ -773,16 +1236,13 @@
           case "submitEnabled": {
             // is the submit arrow present AND not disabled? (Flow disables it with no text / mid-accept)
             const b = findSubmitButton();
-            const dis = !!b && (b.disabled || b.getAttribute("aria-disabled") === "true" || /true/i.test(b.getAttribute("aria-disabled") || ""));
+            const dis = isSubmitButtonDisabled(b);
             return sendResponse({ ok: true, present: !!b, enabled: !!b && !dis });
           }
           case "readPrompt": {
             const box = findPromptBox();
-            let val = "";
-            if (box) {
-              val = box.value !== undefined ? box.value : (box.innerText || box.textContent || "");
-            }
-            return sendResponse({ ok: true, text: norm(val) });
+            const val = readPromptValue(box);
+            return sendResponse({ ok: true, text: norm(val), rawText: val });
           }
           case "dismiss": {
             for (let i = 0; i < 2; i++) {
@@ -798,8 +1258,10 @@
             const r = btn.getBoundingClientRect();
             return sendResponse({ ok: true, x: r.left + r.width / 2, y: r.top + r.height / 2 });
           }
-          case "status":
-            return sendResponse({ ok: true, generating: isGenerating(), genCount: genCount(), media: countMedia(), videos: genVideos().length });
+          case "status": {
+            const errInfo = detectFlowError();
+            return sendResponse({ ok: true, generating: isGenerating(), genCount: genCount(), media: countMedia(), videos: genVideos().length, hasError: errInfo.hasError, errorType: errInfo.type, errorMessage: errInfo.message });
+          }
           case "mediaSrcs":
             // both generated images and videos, newest-first
             return sendResponse({ ok: true, images: genImgItems().map((i) => i.src), videos: genVideos() });
@@ -838,8 +1300,32 @@
                   return sendResponse({ ok: false, error: "No generated image found on page" });
                 }
 
-                const targetImg = imgs[0]; // newest generation is topmost
-                const imgSrc = targetImg.currentSrc || targetImg.src;
+                const excludeSet = new Set((msg.excludeUrls || []).map((u) => String(u || "").trim()).filter(Boolean));
+                if (msg.beforeTopUrl) excludeSet.add(String(msg.beforeTopUrl).trim());
+
+                // If excludeUrls provided, select NEW image(s) not in excludeSet
+                let targetImg = null;
+                if (excludeSet.size > 0) {
+                  const newImgs = imgs.filter((img) => {
+                    const s = (img.currentSrc || img.src || "").trim();
+                    return s && !excludeSet.has(s);
+                  });
+                  if (newImgs.length > 0) {
+                    // In Google Flow, newest tile is the last appended in DOM
+                    targetImg = newImgs[newImgs.length - 1];
+                  }
+                }
+
+                // If not found yet and we were looking for non-excluded images:
+                if (!targetImg) {
+                  if (excludeSet.size > 0) {
+                    return sendResponse({ ok: false, error: "New image not rendered yet", notReady: true });
+                  }
+                  // Fallback: newest image overall (last or first)
+                  targetImg = imgs[imgs.length - 1] || imgs[0];
+                }
+
+                const imgSrc = (targetImg.currentSrc || targetImg.src || "").trim();
 
                 // Method 1: Fetch raw image blob directly in page context (Preserves exact bytes, avoids black canvas)
                 try {

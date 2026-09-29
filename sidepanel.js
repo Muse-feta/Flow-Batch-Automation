@@ -402,6 +402,7 @@ function renderQueueCards() {
         <span class="failed-icon">⚠️</span>
         <span class="failed-msg" id="failed-msg-${index}">Generation failed</span>
         <button type="button" class="btn-card-retry" data-index="${index}">↻ Retry</button>
+        <button type="button" class="btn-card-next" data-index="${index}">Next ⏭</button>
       </div>
     `;
 
@@ -428,7 +429,7 @@ function renderQueueCards() {
     if (retryBtn) {
       retryBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        retryCard(index);
+        handleCardRetryAction(index);
       });
     }
 
@@ -437,7 +438,16 @@ function renderQueueCards() {
     if (cardRetryBtn) {
       cardRetryBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        retryCard(index);
+        handleCardRetryAction(index);
+      });
+    }
+
+    // Next button in failed box
+    const cardNextBtn = card.querySelector(".btn-card-next");
+    if (cardNextBtn) {
+      cardNextBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        handleCardNextAction(index);
       });
     }
 
@@ -626,6 +636,38 @@ if (selectedFolderBadge) {
   selectedFolderBadge.addEventListener("click", chooseDestinationFolder);
 }
 
+
+async function handleCardRetryAction(index) {
+  const item = QUEUE[index];
+  if (!item) return;
+  if (!await validateSubfolder()) return;
+
+  logLine(`🔄 Retrying prompt #${index + 1} (${item.customTag})...`, "ok");
+  updateCardStatus(index, "generating");
+
+  // Check if active batch is currently paused on this card
+  const rResp = await chrome.runtime.sendMessage({ cmd: "retryCurrent", index }).catch(() => null);
+  if (rResp && rResp.ok && rResp.activeBatch) {
+    if (btnPause) {
+      btnPause.disabled = false;
+      btnPause.textContent = "⏸ Pause";
+    }
+    return;
+  }
+
+  // Standalone card retry
+  await retryCard(index);
+}
+
+async function handleCardNextAction(index) {
+  logLine(`⏭ Leaving card #${index + 1} and advancing to next image...`, "ok");
+  if (btnPause) {
+    btnPause.disabled = false;
+    btnPause.textContent = "⏸ Pause";
+  }
+  await chrome.runtime.sendMessage({ type: "skipNext", cmd: "manualNext" }).catch(() => {});
+}
+
 // --- Individual Card Retry --------------------------------------------------
 async function retryCard(index) {
   const item = QUEUE[index];
@@ -638,7 +680,10 @@ async function retryCard(index) {
 
   // Pause batch run if active so debugger won't conflict
   chrome.runtime.sendMessage({ cmd: "pause" }).catch(() => {});
-  if (btnPause) btnPause.textContent = "Resume";
+  if (btnPause) {
+    btnPause.disabled = false;
+    btnPause.textContent = "▶ Resume";
+  }
 
   updateCardStatus(index, "generating");
 
@@ -801,10 +846,17 @@ if (btnStart) {
 if (btnPause) {
   btnPause.addEventListener("click", async () => {
     const isPaused = btnPause.textContent.includes("Resume");
-    await chrome.runtime.sendMessage({ type: isPaused ? "resume" : "pause" });
-    btnPause.textContent = isPaused ? "⏸ Pause" : "▶ Resume";
-    $("now").textContent = isPaused ? `▶ Resumed` : `⏸ Paused`;
-    logLine(isPaused ? "Resumed queue." : "Paused queue.", "warn");
+    if (isPaused) {
+      logLine("Resuming queue ▶...", "ok");
+      await chrome.runtime.sendMessage({ type: "resume" });
+      btnPause.textContent = "⏸ Pause";
+      $("now").textContent = `▶ Resumed`;
+    } else {
+      logLine("Pausing queue ⏸...", "warn");
+      await chrome.runtime.sendMessage({ type: "pause" });
+      btnPause.textContent = "▶ Resume";
+      $("now").textContent = `⏸ Paused`;
+    }
   });
 }
 
@@ -882,6 +934,30 @@ chrome.runtime.onMessage.addListener((m) => {
       const bar = $("bar");
       if (bar) bar.value = m.index;
       if (btnNext) btnNext.disabled = false;
+      if (btnPause) {
+        btnPause.disabled = false;
+        btnPause.textContent = "⏸ Pause";
+      }
+      break;
+
+    case "paused":
+      if (btnPause) {
+        btnPause.disabled = false;
+        btnPause.textContent = "▶ Resume";
+      }
+      if (btnNext) btnNext.disabled = false;
+      $("now").textContent = `⏸ Paused`;
+      break;
+
+    case "resumed":
+      if (btnPause) {
+        btnPause.disabled = false;
+        btnPause.textContent = "⏸ Pause";
+      }
+      if (btnNext) btnNext.disabled = false;
+      const resJob = m.job || (m.index >= 0 && QUEUE[m.index]) || null;
+      const resTag = resJob && resJob.customTag ? `[#${resJob.customTag}] ` : "";
+      $("now").textContent = `▶ Resumed ${resTag}`;
       break;
 
     case "done":
@@ -897,6 +973,10 @@ chrome.runtime.onMessage.addListener((m) => {
       const b = $("bar");
       if (b) b.value = m.index + 1;
       if (btnNext) btnNext.disabled = false;
+      if (btnPause) {
+        btnPause.disabled = false;
+        btnPause.textContent = "⏸ Pause";
+      }
       break;
 
     case "card-status":
@@ -913,6 +993,19 @@ chrome.runtime.onMessage.addListener((m) => {
       }
       break;
 
+    case "generation-failed-pause":
+      CURRENT_INDEX = m.index;
+      CURRENT_JOB = m.job;
+      updateCardStatus(m.index, "failed", null, null, m.error);
+      if (btnNext) btnNext.disabled = false;
+      if (btnPause) {
+        btnPause.disabled = false;
+        btnPause.textContent = "▶ Resume";
+      }
+      $("now").textContent = `⏸ Paused (#${(m.job && m.job.customTag) || (m.index + 1)} failed)`;
+      logLine(`⚠️ Card #${m.index + 1} (${(m.job && m.job.customTag) || ""}) generation stopped: ${m.error}`, "err");
+      logLine(`👉 Action: Click '🔄 Retry' to generate again, or 'Next ⏭' to leave this one and go to next image.`, "warn");
+      break;
     case "error":
       updateCardStatus(m.index, "failed", null, null, m.message);
       logLine(`✗ Card #${m.index + 1}: ${m.message}`, "err");

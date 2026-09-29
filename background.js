@@ -315,8 +315,9 @@ async function findFlowTab() {
   return allTabs.find((t) => t.url && (/flow\.google\.com/i.test(t.url) || /labs\.google\/fx\/tools\/flow/i.test(t.url))) || null;
 }
 
-async function waitForCompletion(tabId, cfg, mediaBefore, beforeTopUrl) {
-  if (isAborted || !RUN || RUN.stopped || RUN.skipWait) return;
+async function waitForCompletion(tabId, cfg, mediaBefore, beforeTopUrl, beforeUrls = new Set()) {
+  if (isAborted || !RUN || RUN.stopped) return { ok: false, error: "Aborted" };
+  if (RUN.skipWait) return { ok: false, error: "Skipped by user", skipped: true };
 
   if (cfg.waitMode === "manual") {
     RUN.awaitingManual = true;
@@ -324,7 +325,19 @@ async function waitForCompletion(tabId, cfg, mediaBefore, beforeTopUrl) {
     while (RUN && RUN.awaitingManual && !isAborted && !RUN.stopped && !RUN.skipWait) {
       await sleep(250);
     }
-    return;
+    if (RUN && RUN.skipWait) return { ok: false, error: "Skipped by user", skipped: true };
+    return { ok: true };
+  }
+
+  if (cfg.waitMode === "fixed") {
+    const waitMs = (cfg.delaySec || 45) * 1000;
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      if (isAborted || !RUN || RUN.stopped) return { ok: false, error: "Aborted" };
+      if (RUN.skipWait) return { ok: false, error: "Skipped by user", skipped: true };
+      await sleep(500);
+    }
+    return { ok: true };
   }
 
   // Poll for generation to complete with sensible timeout (90s for images, 180s for videos)
@@ -332,47 +345,267 @@ async function waitForCompletion(tabId, cfg, mediaBefore, beforeTopUrl) {
   const pollDeadline = Date.now() + timeoutSec * 1000;
   let startedGenerating = false;
 
-  // Wait briefly (up to 3s) for generation to kick off
-  for (let s = 0; s < 6; s++) {
-    if (isAborted || !RUN || RUN.stopped || RUN.skipWait) return;
+  // Wait briefly (up to 3.5s) for generation to kick off
+  for (let s = 0; s < 7; s++) {
+    if (isAborted || !RUN || RUN.stopped) return { ok: false, error: "Aborted" };
+    if (RUN.skipWait) return { ok: false, error: "Skipped by user", skipped: true };
     const st = await send(tabId, { cmd: "status" });
-    if (st.ok && st.generating) {
-      startedGenerating = true;
-      break;
+    if (st.ok) {
+      // Only abort early for fatal prompt errors (e.g. empty prompt validation)
+      if (st.hasError && (st.errorType === "empty_prompt" || st.errorType === "policy")) {
+        return { ok: false, error: st.errorMessage || "Prompt validation failed in Flow" };
+      }
+      if (st.generating) {
+        startedGenerating = true;
+        break;
+      }
     }
     await sleep(500);
   }
 
   // Poll until generation finishes or new image appears
   while (Date.now() < pollDeadline) {
-    if (isAborted || !RUN || RUN.stopped || RUN.skipWait) return;
+    if (isAborted || !RUN || RUN.stopped) return { ok: false, error: "Aborted" };
+    if (RUN.skipWait) return { ok: false, error: "Skipped by user", skipped: true };
     const st = await send(tabId, { cmd: "status" });
     const isBusy = st.ok && st.generating;
-
     if (isBusy) {
       startedGenerating = true;
     }
 
-    // Actively check if a new generated image is available
+    // 1. Actively check if a truly NEW generated image is available
     if (cfg.mode !== "video") {
-      const gRes = await send(tabId, { cmd: "getLatestGeneratedDataUrl" });
-      if (gRes && gRes.ok && gRes.dataUrl) {
-        if ((gRes.src && gRes.src !== beforeTopUrl) || (startedGenerating && !isBusy)) {
-          console.log("[Flow Batch] New image rendered on canvas, generation complete.");
-          await sleep(400);
-          return;
-        }
+      const gRes = await send(tabId, {
+        cmd: "getLatestGeneratedDataUrl",
+        beforeTopUrl,
+        excludeUrls: Array.from(beforeUrls),
+      });
+      if (gRes && gRes.ok && gRes.dataUrl && !beforeUrls.has(gRes.src) && gRes.src !== beforeTopUrl) {
+        console.log("[Flow Batch] New image rendered on canvas, generation complete.");
+        await sleep(400);
+        return { ok: true, dataUrl: gRes.dataUrl, src: gRes.src };
+      }
+    } else {
+      const mres = await send(tabId, { cmd: "mediaItems" });
+      const currentVideos = (mres.ok && mres.videos) || [];
+      const newVid = currentVideos.find((v) => v && !beforeUrls.has(v));
+      if (newVid) {
+        console.log("[Flow Batch] New video rendered on canvas, generation complete.");
+        await sleep(400);
+        return { ok: true, isVideo: true, src: newVid };
       }
     }
 
+    // 2. Only fatal policy violations abort during active generation
+    if (st.ok && st.hasError && (st.errorType === "policy" || st.errorType === "empty_prompt")) {
+      console.warn("[Flow Batch] Flow fatal policy error detected:", st.errorMessage);
+      return { ok: false, error: st.errorMessage || "Generation rejected by policy" };
+    }
+
+    // 3. Agent finished generating (was busy, now idle)
     if (startedGenerating && !isBusy) {
-      console.log("[Flow Batch] Generation status cleared (agent idle).");
-      break;
+      console.log("[Flow Batch] Generation status cleared (agent idle). Verifying result...");
+      await sleep(800);
+
+      // Verify if a real new asset was produced
+      if (cfg.mode !== "video") {
+        const finalG = await send(tabId, {
+          cmd: "getLatestGeneratedDataUrl",
+          beforeTopUrl,
+          excludeUrls: Array.from(beforeUrls),
+        });
+        if (finalG && finalG.ok && finalG.dataUrl && !beforeUrls.has(finalG.src) && finalG.src !== beforeTopUrl) {
+          return { ok: true, dataUrl: finalG.dataUrl, src: finalG.src };
+        }
+
+        // Also check mediaItems for any new <img> src
+        const mres = await send(tabId, { cmd: "mediaItems" });
+        const currentImages = (mres.ok && mres.images) || [];
+        const newImg = currentImages.find((img) => img.src && !beforeUrls.has(img.src));
+        if (newImg) {
+          const bres = await send(tabId, { cmd: "fetchBlobAsDataUrl", url: newImg.src });
+          if (bres && bres.ok && bres.dataUrl) {
+            return { ok: true, dataUrl: bres.dataUrl, src: newImg.src };
+          }
+        }
+      } else {
+        const finalM = await send(tabId, { cmd: "mediaItems" });
+        const currentVideos = (finalM.ok && finalM.videos) || [];
+        const newVid = currentVideos.find((v) => v && !beforeUrls.has(v));
+        if (newVid) {
+          return { ok: true, isVideo: true, src: newVid };
+        }
+      }
+
+      // Check for error text ONLY IF NO NEW IMAGE WAS PRODUCED
+      const errCheck = await send(tabId, { cmd: "checkError" });
+      if (errCheck && errCheck.hasError) {
+        return { ok: false, error: errCheck.message };
+      }
+
+      // No new media and agent stopped => generation failed!
+      return { ok: false, error: "Generation failed: No new image was produced" };
     }
     await sleep(600);
   }
 
-  await sleep(400);
+  // Timed out: check error or final state
+  const errFinal = await send(tabId, { cmd: "checkError" });
+  if (errFinal && errFinal.hasError) {
+    return { ok: false, error: errFinal.message };
+  }
+  return { ok: false, error: "Generation timed out without producing a new image" };
+}
+
+async function diagnoseFlowDOM(tabId) {
+  try {
+    const diag = await send(tabId, { cmd: "diagnoseDOM" });
+    if (diag && diag.ok) {
+      console.log("[Flow Batch Diagnostic] Google Flow DOM Diagnostic:", diag);
+      emit({
+        kind: "info",
+        message: `[Diag] Flow input: <${diag.promptBox ? diag.promptBox.tagName : 'none'}> (${diag.promptBox ? (diag.promptBox.isTextarea ? 'textarea' : diag.promptBox.isContentEditable ? 'contenteditable' : 'other') : 'not found'}), Submit: ${diag.submitButton ? (diag.submitButton.effectivelyDisabled ? 'disabled' : 'enabled') : 'not found'}`
+      });
+// Diagnostic kept in memory/console only; no JSON file download
+    }
+  } catch (e) {
+    console.warn("[Flow Batch Diagnostic] Failed to diagnose Flow DOM:", e);
+  }
+}
+
+async function injectAndSubmitPrompt(tabId, job, promptKey, f) {
+  console.log(`[Flow Batch] Queue prompt: #${job.customTag} "${job.prompt.slice(0, 60)}..."`);
+  console.log(`[Flow Batch] Injecting prompt...`);
+
+  let typed = false;
+  let lastVal = "";
+
+  for (let a = 0; a < 4 && !typed && !isAborted && (!RUN || !RUN.stopped) && (!RUN || !RUN.skipWait); a++) {
+    if (a > 0) {
+      console.log(`[Flow Batch] Retrying prompt injection (attempt ${a + 1}/4)...`);
+      await send(tabId, { cmd: "dismiss" });
+      const rf = await send(tabId, { cmd: "focusPrompt" });
+      if (rf.ok) { f.x = rf.x; f.y = rf.y; }
+      await sleep(200);
+    }
+
+    // Strategy A: CDP trusted keystroke insertion
+    try {
+      await cdpType(tabId, f.x, f.y, job.prompt);
+      await sleep(250);
+    } catch (e) {
+      console.warn("[Flow Batch] CDP type warning:", e.message);
+    }
+
+    // Verify if CDP insertion registered
+    let vRes = await send(tabId, { cmd: "verifyPrompt", expected: promptKey });
+    if (vRes && vRes.ok && vRes.verified) {
+      typed = true;
+      lastVal = vRes.rawText || vRes.text;
+      break;
+    }
+
+    // Strategy B: Content script DOM / React state injection
+    console.log("[Flow Batch] CDP typing did not fully register in Flow state; falling back to direct React/DOM injection...");
+    await send(tabId, { cmd: "typePrompt", text: job.prompt });
+    await sleep(250);
+
+    // Verify after DOM injection
+    vRes = await send(tabId, { cmd: "verifyPrompt", expected: promptKey });
+    if (vRes && vRes.ok && vRes.verified) {
+      typed = true;
+      lastVal = vRes.rawText || vRes.text;
+      break;
+    } else if (vRes && vRes.ok) {
+      lastVal = vRes.rawText || vRes.text;
+    }
+  }
+
+  console.log(`[Flow Batch] Input value after injection: "${lastVal ? lastVal.slice(0, 60) + "..." : "(empty)"}"`);
+  console.log(`[Flow Batch] Flow recognized prompt: ${typed ? "YES" : "NO"}`);
+
+  // PRE-SUBMIT VALIDATION (CRITICAL REQUIREMENT 8):
+  // IF prompt is empty or not recognized, DO NOT CLICK GENERATE!
+  if (!typed) {
+    console.error(`[Flow Batch] VALIDATION FAILED: Prompt #${job.customTag} is NOT present in Flow input!`);
+    console.error(`[Flow Batch] Aborting Generate click to prevent 'Prompt must be provided' error.`);
+    return { ok: false, error: "Prompt was not registered in Flow input — aborted submit to prevent 'Prompt must be provided'" };
+  }
+
+  // Submit prompt — ONLY after verification succeeded!
+  const boxCleared = async () => {
+    const r = await send(tabId, { cmd: "readPrompt" });
+    return r.ok && !(r.text || "").includes(promptKey);
+  };
+
+  let submitted = false;
+  for (let attempt = 0; attempt < 6 && !submitted && !isAborted && (!RUN || !RUN.stopped) && (!RUN || !RUN.skipWait); attempt++) {
+    // Wait for submit button to be present and enabled
+    for (let w = 0; w < 12; w++) {
+      if (isAborted || (RUN && RUN.stopped)) break;
+      const se = await send(tabId, { cmd: "submitEnabled" });
+      if (se.ok && se.enabled) {
+        console.log(`[Flow Batch] Generate button state: enabled`);
+        break;
+      }
+      await sleep(200);
+    }
+    if (isAborted || (RUN && RUN.stopped)) break;
+
+    const sr = await send(tabId, { cmd: "submitRect" });
+    if (sr.ok) {
+      console.log(`[Flow Batch] Clicking Generate at (${Math.round(sr.x)}, ${Math.round(sr.y)})...`);
+      try { await cdpClick(tabId, sr.x, sr.y); } catch (e) {}
+    }
+
+    // Wait to confirm submission
+    for (let t = 0; t < 8 && !submitted && !isAborted && (!RUN || !RUN.skipWait); t++) {
+      await sleep(300);
+      const st = await send(tabId, { cmd: "status" });
+      if (st.ok && st.hasError && st.errorType === "empty_prompt") {
+        console.warn("[Flow Batch] Flow displayed 'Prompt must be provided' error toast! Submission rejected.");
+        break;
+      }
+      if (st.ok && st.generating) {
+        console.log("[Flow Batch] Generation started confirmed by Flow status.");
+        submitted = true;
+        break;
+      }
+      if (await boxCleared()) {
+        const errCheck = await send(tabId, { cmd: "status" });
+        if (errCheck.ok && errCheck.hasError && errCheck.errorType === "empty_prompt") {
+          console.warn("[Flow Batch] Box was cleared due to empty_prompt error, not real submission.");
+          break;
+        }
+        console.log("[Flow Batch] Prompt box cleared — prompt accepted by Flow.");
+        submitted = true;
+        break;
+      }
+    }
+
+    if (submitted || isAborted || (RUN && RUN.stopped) || (RUN && RUN.skipWait)) break;
+
+    // Fallback: Press Enter on the prompt box
+    const pr = await send(tabId, { cmd: "promptRect" });
+    if (pr.ok) {
+      console.log("[Flow Batch] Submit button click did not trigger generation; trying Enter key...");
+      try { await cdpClick(tabId, pr.x, pr.y); await sleep(100); await cdpEnter(tabId); } catch (e) {}
+    }
+    for (let t = 0; t < 6 && !submitted && !isAborted && (!RUN || !RUN.skipWait); t++) {
+      await sleep(300);
+      const st = await send(tabId, { cmd: "status" });
+      if (st.ok && st.generating) {
+        submitted = true;
+        break;
+      }
+      if (await boxCleared()) {
+        submitted = true;
+        break;
+      }
+    }
+  }
+
+  return { ok: submitted, skipped: !!(RUN && RUN.skipWait) };
 }
 
 async function runLoop() {
@@ -405,32 +638,44 @@ async function runLoop() {
     return;
   }
 
-  // Download the media a single job just produced. Compares media before and after to download new assets.
-  async function downloadJob(job, beforeMedia) {
-    if (!cfg.autoDownload || isAborted || (RUN && RUN.stopped)) return;
+  // Download the media a single job just produced.
+  async function downloadJob(job, beforeMedia, verifiedDataUrl) {
+    if (!cfg.autoDownload || isAborted || (RUN && RUN.stopped)) return null;
     const tag = job.customTag || String(job.n).padStart(2, "0");
 
     await sleep(250); // slight pause to ensure DOM handles final paint
-    if (isAborted || (RUN && RUN.stopped)) return;
+    if (isAborted || (RUN && RUN.stopped)) return null;
 
     const timestamp = (RUN && RUN.timestamp) || stampNow();
     const customFolder = (RUN && RUN.customFolder) || resolveDownloadFolder(cfg, timestamp);
 
-    // 1) Primary path for Images: extract clean PNG Data URL directly via getLatestGeneratedDataUrl
+    // 1) Primary path for Images: if verifiedDataUrl was already acquired during waitForCompletion, save directly
     if (cfg.mode !== "video") {
-      const gRes = await send(tabId, { cmd: "getLatestGeneratedDataUrl" });
-      if (gRes && gRes.ok && gRes.dataUrl) {
+      let dataUrlToSave = verifiedDataUrl;
+      if (!dataUrlToSave) {
+        const prevImages = (beforeMedia && beforeMedia.images) || [];
+        const prevUrls = prevImages.map((i) => i.src).filter(Boolean);
+        const gRes = await send(tabId, {
+          cmd: "getLatestGeneratedDataUrl",
+          excludeUrls: prevUrls,
+        });
+        if (gRes && gRes.ok && gRes.dataUrl) {
+          dataUrlToSave = gRes.dataUrl;
+        }
+      }
+
+      if (dataUrlToSave) {
         const fileName = `${tag}.png`;
         const filename = `${customFolder}/${fileName}`;
-        console.log(`[Flow Batch] Extracted latest PNG dataUrl (${gRes.naturalWidth}x${gRes.naturalHeight}) for #${job.n} (${tag})`);
-        emit({ kind: "info", message: `Extracted PNG for #${job.n} (${tag})` });
+        console.log(`[Flow Batch] Saving image for #${job.n} (${tag})...`);
+        emit({ kind: "info", message: `Saving image for #${job.n} (${tag})...` });
 
-        const saved = await saveMedia(tabId, 0, gRes.dataUrl, filename, cfg.upscale, false);
+        const saved = await saveMedia(tabId, 0, dataUrlToSave, filename, cfg.upscale, false);
         emit({ kind: "info", message: `✓ saved 1/1 → Downloads/${customFolder}/` });
         return {
           done: saved && saved.ok ? 1 : 0,
           total: 1,
-          dataUrl: gRes.dataUrl,
+          dataUrl: dataUrlToSave,
           filename: saved && saved.ok ? saved.filename : filename,
         };
       }
@@ -514,13 +759,16 @@ async function runLoop() {
       console.log("[Flow Batch] Batch stopped by user.");
       break;
     }
-    while (RUN.paused && !isAborted && !RUN.stopped && !RUN.skipWait) await sleep(250);
+    while (RUN.paused && !isAborted && !RUN.stopped && !RUN.skipWait && !RUN.retryRequested) {
+      await sleep(250);
+    }
     if (isAborted || RUN.stopped) {
       console.log("[Flow Batch] Batch stopped by user.");
       break;
     }
 
     RUN.skipWait = false;
+    RUN.retryRequested = false;
     const job = RUN.queue[RUN.i];
 
     // Ensure customTag exists
@@ -535,167 +783,183 @@ async function runLoop() {
       }
     }
 
-    emit({ kind: "start", index: RUN.i, total: RUN.queue.length, job });
+    // Inner retry loop for current prompt (allows Retry or Next)
+    let promptFinished = false;
+    while (!promptFinished && !isAborted && !RUN.stopped) {
+      RUN.retryRequested = false;
+      RUN.skipWait = false;
 
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
+      emit({ kind: "start", index: RUN.i, total: RUN.queue.length, job });
 
-    // 0) dismiss any stray menu/popover left open from the previous prompt
-    await send(tabId, { cmd: "dismiss" });
-    try { await chrome.tabs.update(tabId, { active: true }); } catch (_) {}
-
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
-
-    // Snapshot media BEFORE submitting this prompt
-    const beforeMediaRes = await send(tabId, { cmd: "mediaItems" });
-    const beforeMedia = {
-      images: (beforeMediaRes.ok && beforeMediaRes.images) || [],
-      videos: (beforeMediaRes.ok && beforeMediaRes.videos) || [],
-    };
-    const beforeMediaCount = beforeMedia.images.length + beforeMedia.videos.length;
-    const beforeTopUrl = (beforeMedia.images[0] && beforeMedia.images[0].src) || beforeMedia.videos[0] || "";
-
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
-
-    // 1) focus + clear the prompt box (content script), get its center point
-    const f = await send(tabId, { cmd: "focusPrompt" });
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
-    if (!f.ok) {
-      emit({ kind: "error", index: RUN.i, job, message: "focus: " + f.error });
-      await sleep(cfg.gapSec * 1000);
-      continue;
-    }
-
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
-
-    // 2) type the prompt with TRUSTED keystrokes (debugger), then verify it landed.
-    const promptKey = job.prompt.slice(0, 24).toLowerCase();
-    const didType = async () => {
-      const r = await send(tabId, { cmd: "readPrompt" });
-      return r.ok && (r.text || "").includes(promptKey);
-    };
-    let typed = false;
-    for (let a = 0; a < 3 && !typed && !isAborted && !RUN.stopped && !RUN.skipWait; a++) {
-      if (a > 0) {
-        await send(tabId, { cmd: "dismiss" });
-        const rf = await send(tabId, { cmd: "focusPrompt" });
-        if (rf.ok) { f.x = rf.x; f.y = rf.y; }
-        await sleep(250);
-      }
-      try { await cdpType(tabId, f.x, f.y, job.prompt); }
-      catch (e) { emit({ kind: "warn", message: "type (debugger): " + e.message }); }
-      await sleep(350);
-      typed = await didType();
-      if (!typed) {
-        // Fallback: direct synthetic injection via content script
-        await send(tabId, { cmd: "typePrompt", text: job.prompt });
-        await sleep(250);
-        typed = await didType();
-      }
-    }
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
-    if (RUN.skipWait) {
-      continue;
-    }
-    if (!typed) {
-      emit({ kind: "error", index: RUN.i, job, message: "prompt didn't type into Flow — skipping (make sure the Flow tab is the active/focused window)" });
-      await send(tabId, { cmd: "dismiss" });
-      await sleep(cfg.gapSec * 1000);
-      continue;
-    }
-
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
-
-    // submit as a TRUSTED click; confirm success by the prompt box CLEARING
-    const boxCleared = async () => {
-      const r = await send(tabId, { cmd: "readPrompt" });
-      return r.ok && !(r.text || "").includes(promptKey);
-    };
-    let submitted = false;
-    for (let attempt = 0; attempt < 6 && !submitted && !isAborted && !RUN.stopped && !RUN.skipWait; attempt++) {
-      for (let w = 0; w < 12; w++) {
-        if (isAborted || RUN.stopped) break;
-        const se = await send(tabId, { cmd: "submitEnabled" });
-        if (se.ok && se.enabled) break;
-        await sleep(200);
-      }
       if (isAborted || RUN.stopped) break;
-      const sr = await send(tabId, { cmd: "submitRect" });
-      if (sr.ok) { try { await cdpClick(tabId, sr.x, sr.y); } catch (e) {} }
-      for (let t = 0; t < 8 && !submitted && !isAborted && !RUN.skipWait; t++) {
-        await sleep(300);
-        if (await boxCleared()) submitted = true;
-      }
-      if (submitted || isAborted || RUN.stopped || RUN.skipWait) break;
-      const pr = await send(tabId, { cmd: "promptRect" });
-      if (pr.ok) { try { await cdpClick(tabId, pr.x, pr.y); await sleep(100); await cdpEnter(tabId); } catch (e) {} }
-      for (let t = 0; t < 6 && !submitted && !isAborted && !RUN.skipWait; t++) {
-        await sleep(300);
-        if (await boxCleared()) submitted = true;
-      }
-    }
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
-    if (RUN.skipWait) {
-      continue;
-    }
-    if (!submitted) {
-      emit({ kind: "error", index: RUN.i, job, message: "couldn't submit after retries — skipping this prompt" });
+
+      // 0) dismiss any stray menu/popover left open from the previous prompt
       await send(tabId, { cmd: "dismiss" });
-      await sleep(cfg.gapSec * 1000);
-      continue;
-    }
-    RUN.submitted.push(job);
+      try { await chrome.tabs.update(tabId, { active: true }); } catch (_) {}
 
-    // Active polling for completion without long static delays
-    await waitForCompletion(tabId, cfg, beforeMediaCount, beforeTopUrl);
+      if (isAborted || RUN.stopped) break;
 
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
+      // Snapshot media BEFORE submitting this prompt
+      const beforeMediaRes = await send(tabId, { cmd: "mediaItems" });
+      const beforeMedia = {
+        images: (beforeMediaRes.ok && beforeMediaRes.images) || [],
+        videos: (beforeMediaRes.ok && beforeMediaRes.videos) || [],
+      };
+      const beforeMediaCount = beforeMedia.images.length + beforeMedia.videos.length;
+      const beforeTopUrl = (beforeMedia.images[0] && beforeMedia.images[0].src) || beforeMedia.videos[0] || "";
+      const beforeUrls = new Set(beforeMedia.images.map((i) => i.src).filter(Boolean).concat(beforeMedia.videos.filter(Boolean)));
 
-    let dlRes = null;
-    if (!RUN.skipWait) {
-      dlRes = await downloadJob(job, beforeMedia);
-    }
+      if (isAborted || RUN.stopped) break;
 
-    if (isAborted || RUN.stopped) {
-      console.log("[Flow Batch] Batch stopped by user.");
-      break;
-    }
+      // 1) focus + clear the prompt box
+      const f = await send(tabId, { cmd: "focusPrompt" });
+      if (isAborted || RUN.stopped) break;
+      if (!f.ok) {
+        emit({ kind: "error", index: RUN.i, job, message: "focus: " + f.error });
+        RUN.paused = true;
+        RUN.awaitingUserChoice = true;
+        RUN.failedIndex = RUN.i;
+        emit({ kind: "generation-failed-pause", index: RUN.i, job, error: "Focus prompt failed: " + f.error });
+        while (RUN.paused && !RUN.retryRequested && !RUN.skipWait && !isAborted && !RUN.stopped) await sleep(250);
+        if (isAborted || RUN.stopped) break;
+        if (RUN.skipWait) {
+          RUN.skipWait = false;
+          RUN.paused = false;
+          RUN.awaitingUserChoice = false;
+          promptFinished = true;
+          break;
+        }
+        if (RUN.retryRequested || !RUN.paused) {
+          RUN.retryRequested = false;
+          RUN.paused = false;
+          RUN.awaitingUserChoice = false;
+          emit({ kind: "card-status", index: RUN.i, status: "generating", job });
+          continue;
+        }
+      }
 
-    emit({
-      kind: "done",
-      index: RUN.i,
-      job,
-      dataUrl: dlRes ? dlRes.dataUrl : null,
-      filename: dlRes ? dlRes.filename : null,
-    });
-    if (!RUN.skipWait) {
-      await sleep(cfg.gapSec * 1000);
+      // 2) Type and submit prompt with pre-validation
+      const promptKey = job.prompt.slice(0, 24).toLowerCase();
+      const subRes = await injectAndSubmitPrompt(tabId, job, promptKey, f);
+
+      if (isAborted || RUN.stopped) break;
+
+      if (RUN.skipWait || (subRes && subRes.skipped)) {
+        console.log(`[Flow Batch] User clicked Next during injection: skipping #${job.customTag}`);
+        RUN.skipWait = false;
+        RUN.paused = false;
+        RUN.awaitingUserChoice = false;
+        promptFinished = true;
+        break;
+      }
+
+      if (!subRes.ok) {
+        const errMsg = subRes.error || "Prompt submission failed (Flow did not accept prompt)";
+        emit({ kind: "error", index: RUN.i, job, message: errMsg });
+        RUN.paused = true;
+        RUN.awaitingUserChoice = true;
+        RUN.failedIndex = RUN.i;
+        emit({ kind: "generation-failed-pause", index: RUN.i, job, error: errMsg });
+        while (RUN.paused && !RUN.retryRequested && !RUN.skipWait && !isAborted && !RUN.stopped) await sleep(250);
+        if (isAborted || RUN.stopped) break;
+        if (RUN.skipWait) {
+          RUN.skipWait = false;
+          RUN.paused = false;
+          RUN.awaitingUserChoice = false;
+          promptFinished = true;
+          break;
+        }
+        if (RUN.retryRequested || !RUN.paused) {
+          RUN.retryRequested = false;
+          RUN.paused = false;
+          RUN.awaitingUserChoice = false;
+          emit({ kind: "card-status", index: RUN.i, status: "generating", job });
+          continue;
+        }
+      }
+
+      RUN.submitted.push(job);
+
+      // 4) Active polling for completion with error detection
+      const compRes = await waitForCompletion(tabId, cfg, beforeMediaCount, beforeTopUrl, beforeUrls);
+
+      if (isAborted || RUN.stopped) break;
+
+      if (RUN.skipWait || (compRes && compRes.skipped)) {
+        console.log(`[Flow Batch] User clicked Next: skipping wait for #${job.customTag}`);
+        RUN.skipWait = false;
+        RUN.paused = false;
+        RUN.awaitingUserChoice = false;
+        promptFinished = true;
+        break;
+      }
+
+      if (compRes && compRes.ok) {
+        // Generation SUCCEEDED! Save real media
+        let dlRes = null;
+        if (!RUN.skipWait) {
+          dlRes = await downloadJob(job, beforeMedia, compRes.dataUrl);
+        }
+
+        emit({
+          kind: "done",
+          index: RUN.i,
+          job,
+          dataUrl: dlRes ? dlRes.dataUrl : (compRes.dataUrl || null),
+          filename: dlRes ? dlRes.filename : null,
+        });
+
+        promptFinished = true;
+        if (!RUN.skipWait && cfg.gapSec) {
+          await sleep(cfg.gapSec * 1000);
+        }
+        break;
+      } else {
+        // GENERATION FAILED (policy, unusual activity, no new image, etc.)!
+        const failMsg = (compRes && compRes.error) || "Generation failed";
+        console.warn(`[Flow Batch] Generation failed for #${job.customTag}:`, failMsg);
+
+        // NEVER download previous image!
+        // Pause generation and wait for user choice
+        RUN.paused = true;
+        RUN.awaitingUserChoice = true;
+        RUN.failedIndex = RUN.i;
+
+        emit({
+          kind: "generation-failed-pause",
+          index: RUN.i,
+          job,
+          error: failMsg,
+        });
+
+        // Wait for user to click Retry or Next or Resume
+        while (RUN.paused && !RUN.retryRequested && !RUN.skipWait && !isAborted && !RUN.stopped) {
+          await sleep(250);
+        }
+
+        if (isAborted || RUN.stopped) break;
+
+        if (RUN.skipWait) {
+          // User clicked Next: leave this one and advance to next image
+          console.log(`[Flow Batch] User clicked Next: leaving #${job.customTag} and advancing`);
+          RUN.skipWait = false;
+          RUN.paused = false;
+          RUN.awaitingUserChoice = false;
+          promptFinished = true; // exit retry loop for this prompt, so outer loop increments RUN.i
+          break;
+        }
+
+        if (RUN.retryRequested || !RUN.paused) {
+          // User clicked Retry or Resume: try generating this image again
+          console.log(`[Flow Batch] User clicked Retry/Resume: re-attempting #${job.customTag}`);
+          RUN.retryRequested = false;
+          RUN.paused = false;
+          RUN.awaitingUserChoice = false;
+          emit({ kind: "card-status", index: RUN.i, status: "generating", job });
+          // Loop will retry generating this exact prompt!
+          continue;
+        }
+      }
     }
   }
 
@@ -819,6 +1083,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           ping = await send(tab.id, { cmd: "ping" });
           if (!ping.ok) return sendResponse({ ok: false, error: "Flow adapter not loaded — reload the Flow tab." });
         }
+// Ready to start batch
+
         if (!ping.project) return sendResponse({ ok: false, error: "Open a Flow PROJECT (click New project), then start." });
         const cfg = { ...DEFAULTS, ...(msg.cfg || {}) };
         const ts = stampNow();
@@ -834,16 +1100,59 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         runLoop();
         return sendResponse({ ok: true, count: msg.queue.length });
       }
-      case "pause": if (RUN) RUN.paused = true; return sendResponse({ ok: true });
-      case "resume": if (RUN) RUN.paused = false; return sendResponse({ ok: true });
+      case "diagnose": {
+        const tab = await findFlowTab();
+        if (!tab) return sendResponse({ ok: false, error: "No Google Flow tab found" });
+        await diagnoseFlowDOM(tab.id);
+        const diag = await send(tab.id, { cmd: "diagnoseDOM" });
+        return sendResponse(diag);
+      }
+      case "pause": {
+        if (RUN) {
+          RUN.paused = true;
+          emit({ kind: "paused", index: RUN.i, job: RUN.queue ? RUN.queue[RUN.i] : null });
+          console.log("[Flow Batch] Queue paused by user at index", RUN.i);
+        }
+        return sendResponse({ ok: true });
+      }
+      case "resume": {
+        if (RUN) {
+          RUN.paused = false;
+          if (RUN.awaitingUserChoice) {
+            RUN.retryRequested = true;
+            RUN.awaitingUserChoice = false;
+          }
+          cancelActiveDelays();
+          emit({ kind: "resumed", index: RUN.i, job: RUN.queue ? RUN.queue[RUN.i] : null });
+          console.log("[Flow Batch] Queue resumed by user at index", RUN.i);
+        }
+        return sendResponse({ ok: true });
+      }
+      case "retryCurrent": {
+        if (RUN && RUN.running && (RUN.awaitingUserChoice || RUN.paused)) {
+          if (typeof msg.index === "number" && msg.index >= 0 && msg.index < RUN.queue.length) {
+            RUN.i = msg.index;
+          }
+          RUN.retryRequested = true;
+          RUN.paused = false;
+          RUN.awaitingUserChoice = false;
+          cancelActiveDelays();
+          emit({ kind: "resumed", index: RUN.i, job: RUN.queue ? RUN.queue[RUN.i] : null });
+          console.log("[Flow Batch] Retry current requested for index", RUN.i);
+          return sendResponse({ ok: true, activeBatch: true });
+        }
+        return sendResponse({ ok: false, error: "No active paused prompt" });
+      }
       case "skipNext":
       case "manualNext": {
         if (RUN) {
           RUN.awaitingManual = false;
+          RUN.awaitingUserChoice = false;
           RUN.skipWait = true;
           RUN.paused = false;
+          cancelActiveDelays();
           console.log("[Flow Batch] Next / Skip requested for prompt index", RUN.i);
-          emit({ kind: "info", message: "⏭ Advancing to next prompt..." });
+          emit({ kind: "info", message: "➔ Advancing to next prompt..." });
         }
         return sendResponse({ ok: true });
       }
@@ -907,89 +1216,44 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           const f = await send(tab.id, { cmd: "focusPrompt" });
           if (!f.ok) throw new Error("Focus failed: " + f.error);
 
-          // 2) Type prompt
+          // 2) Type and submit prompt with pre-validation
           const promptKey = (job.prompt || "").slice(0, 24).toLowerCase();
-          const didType = async () => {
-            const r = await send(tab.id, { cmd: "readPrompt" });
-            return r.ok && (r.text || "").includes(promptKey);
-          };
-          let typed = false;
-          for (let a = 0; a < 3 && !typed; a++) {
-            if (a > 0) {
-              await send(tab.id, { cmd: "dismiss" });
-              const rf = await send(tab.id, { cmd: "focusPrompt" });
-              if (rf.ok) { f.x = rf.x; f.y = rf.y; }
-              await sleep(250);
-            }
-            try { await cdpType(tab.id, f.x, f.y, job.prompt); } catch (e) {}
-            await sleep(350);
-            typed = await didType();
-            if (!typed) {
-              await send(tab.id, { cmd: "typePrompt", text: job.prompt });
-              await sleep(250);
-              typed = await didType();
-            }
+          const subRes = await injectAndSubmitPrompt(tab.id, job, promptKey, f);
+          if (!subRes.ok) {
+            throw new Error(subRes.error || "Prompt submission failed — make sure Flow tab is active");
           }
-          if (!typed) throw new Error("Prompt typing failed — make sure Flow tab is active");
-
-          // 3) Submit prompt
-          const boxCleared = async () => {
-            const r = await send(tab.id, { cmd: "readPrompt" });
-            return r.ok && !(r.text || "").includes(promptKey);
-          };
-          let submitted = false;
-          for (let attempt = 0; attempt < 6 && !submitted; attempt++) {
-            for (let w = 0; w < 12; w++) {
-              const se = await send(tab.id, { cmd: "submitEnabled" });
-              if (se.ok && se.enabled) break;
-              await sleep(200);
-            }
-            const sr = await send(tab.id, { cmd: "submitRect" });
-            if (sr.ok) { try { await cdpClick(tab.id, sr.x, sr.y); } catch (e) {} }
-            for (let t = 0; t < 8 && !submitted; t++) {
-              await sleep(300);
-              if (await boxCleared()) submitted = true;
-            }
-            if (submitted) break;
-            const pr = await send(tab.id, { cmd: "promptRect" });
-            if (pr.ok) { try { await cdpClick(tab.id, pr.x, pr.y); await sleep(100); await cdpEnter(tab.id); } catch (e) {} }
-            for (let t = 0; t < 6 && !submitted; t++) {
-              await sleep(300);
-              if (await boxCleared()) submitted = true;
-            }
-          }
-          if (!submitted) throw new Error("Prompt submission failed after retries");
 
           // 4) Wait for generation
           const originalRun = RUN;
           if (!RUN || !RUN.running) {
             RUN = { stopped: false, running: true, cfg, timestamp, customFolder };
           }
-          await waitForCompletion(tab.id, cfg, beforeMediaCount, beforeTopUrl);
+          const compRes = await waitForCompletion(tab.id, cfg, beforeMediaCount, beforeTopUrl, beforeUrls);
           if (!originalRun) RUN = null;
+
+          if (!compRes || !compRes.ok) {
+            throw new Error((compRes && compRes.error) || "Generation failed in Flow");
+          }
 
           // 5) Fetch resulting media
           await sleep(250);
           const tag = job.customTag || String(job.n).padStart(2, "0");
 
-          // Primary path for Images: getLatestGeneratedDataUrl
-          if (cfg.mode !== "video") {
-            const gRes = await send(tab.id, { cmd: "getLatestGeneratedDataUrl" });
-            if (gRes && gRes.ok && gRes.dataUrl) {
-              const fileName = `${tag}.png`;
-              const filename = `${customFolder}/${fileName}`;
-              const saved = await saveMedia(tab.id, 0, gRes.dataUrl, filename, cfg.upscale, false);
-              await dbgDetach();
-              const finalDataUrl = gRes.dataUrl;
-              emit({
-                kind: "card-done",
-                index: cardIndex,
-                job,
-                dataUrl: finalDataUrl,
-                filename: saved && saved.ok ? saved.filename : filename,
-              });
-              return sendResponse({ ok: true, dataUrl: finalDataUrl, filename: saved && saved.ok ? saved.filename : filename });
-            }
+          // Primary path for Images: use verified compRes.dataUrl directly
+          if (cfg.mode !== "video" && compRes.dataUrl) {
+            const fileName = `${tag}.png`;
+            const filename = `${customFolder}/${fileName}`;
+            const saved = await saveMedia(tab.id, 0, compRes.dataUrl, filename, cfg.upscale, false);
+            await dbgDetach();
+            const finalDataUrl = compRes.dataUrl;
+            emit({
+              kind: "card-done",
+              index: cardIndex,
+              job,
+              dataUrl: finalDataUrl,
+              filename: saved && saved.ok ? saved.filename : filename,
+            });
+            return sendResponse({ ok: true, dataUrl: finalDataUrl, filename: saved && saved.ok ? saved.filename : filename });
           }
 
           const mres = await send(tab.id, { cmd: "mediaItems" });
